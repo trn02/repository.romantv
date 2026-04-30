@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.video.hdmozi"
+       name="Román TV"
+       version="1.0.2"
+       provider-name="OpenCode">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0" />
+        <import addon="script.module.resolveurl" />
+    </requires>
+    <extension point="xbmc.python.pluginsource" library="default.py">
+        <provides>video</provides>
+    </extension>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="hu">This cement is best cement</summary>
+        <description lang="hu">This cement is best cement</description>
+        <platform>all</platform>
+        <language>hu</language>
+        <assets>
+            <icon>logo.png</icon>
+        </assets>
+    </extension>
+</addon>

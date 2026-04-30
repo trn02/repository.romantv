@@ -1,0 +1,1018 @@
+from __future__ import unicode_literals
+
+import base64
+import binascii
+import html
+import json
+import os
+import random
+import re
+import shutil
+import string
+import subprocess
+import sys
+import traceback
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+import xbmc
+import xbmcaddon
+import xbmcgui
+import xbmcplugin
+import xbmcvfs
+
+from resources.lib.aes import decrypt_cbc
+
+
+ADDON = xbmcaddon.Addon()
+ADDON_HANDLE = int(sys.argv[1])
+BASE_URL = sys.argv[0]
+PROFILE_DIR = xbmcvfs.translatePath(ADDON.getAddonInfo("profile"))
+SEARCHES_FILE = os.path.join(PROFILE_DIR, "saved_searches.json")
+SITE_URL = "https://hdmozi.hu"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+VIDEA_STATIC_SECRET = "xHb0ZvME5q8CBcoQi6AngerDu3FGO9fkUlwPmLVY_RTzj2hJIS4NasXWKy1td7p"
+
+
+def ensure_profile_dir():
+    if not xbmcvfs.exists(PROFILE_DIR):
+        xbmcvfs.mkdirs(PROFILE_DIR)
+
+
+def build_url(**query):
+    return "{}?{}".format(BASE_URL, urllib.parse.urlencode(query))
+
+
+def log(message):
+    xbmc.log("[plugin.video.hdmozi] {}".format(message), xbmc.LOGINFO)
+
+
+def request(url, data=None, headers=None, return_headers=False):
+    final_headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": SITE_URL + "/",
+        "Accept-Language": "hu-HU,hu;q=0.9,en;q=0.8",
+    }
+    if headers:
+        final_headers.update(headers)
+
+    payload = None
+    if data is not None:
+        payload = urllib.parse.urlencode(data).encode("utf-8")
+
+    req = urllib.request.Request(url, data=payload, headers=final_headers)
+    with urllib.request.urlopen(req, timeout=20) as response:
+        body = response.read()
+        if return_headers:
+            return body, response.headers
+        return body
+
+
+def request_text(url, data=None, headers=None, encoding="utf-8", return_headers=False):
+    response = request(url, data=data, headers=headers, return_headers=return_headers)
+    if return_headers:
+        body, response_headers = response
+        return body.decode(encoding, "replace"), response_headers
+    return response.decode(encoding, "replace")
+
+
+def request_json(url, data=None, headers=None):
+    return json.loads(request_text(url, data=data, headers=headers))
+
+
+def strip_tags(text):
+    return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
+
+
+def normalize_url(url):
+    if not url:
+        return url
+    url = html.unescape(url).strip().strip('"\'')
+    if url.startswith("direct://"):
+        return url[len("direct://"):]
+    if url.startswith("//"):
+        return "https:" + url
+    return url
+
+
+def load_saved_searches():
+    ensure_profile_dir()
+    if not os.path.exists(SEARCHES_FILE):
+        return []
+    with open(SEARCHES_FILE, "r", encoding="utf-8") as handle:
+        try:
+            data = json.load(handle)
+        except ValueError:
+            return []
+    return [item for item in data if isinstance(item, str) and item.strip()]
+
+
+def save_saved_searches(searches):
+    ensure_profile_dir()
+    with open(SEARCHES_FILE, "w", encoding="utf-8") as handle:
+        json.dump(searches, handle, ensure_ascii=False, indent=2)
+
+
+def remember_search(query):
+    searches = load_saved_searches()
+    filtered = [item for item in searches if item.lower() != query.lower()]
+    filtered.insert(0, query)
+    save_saved_searches(filtered[:50])
+
+
+def delete_saved_search(query):
+    searches = load_saved_searches()
+    searches = [item for item in searches if item.lower() != query.lower()]
+    save_saved_searches(searches)
+
+
+def add_directory_item(label, target_query, is_folder=True, art=None, info=None, context=None):
+    item = xbmcgui.ListItem(label=label)
+    if art:
+        item.setArt(art)
+    if info:
+        item.setInfo("video", info)
+    if context:
+        item.addContextMenuItems(context)
+    xbmcplugin.addDirectoryItem(
+        handle=ADDON_HANDLE,
+        url=build_url(**target_query),
+        listitem=item,
+        isFolder=is_folder,
+    )
+
+
+def add_playable_item(label, target_query, art=None, info=None):
+    item = xbmcgui.ListItem(label=label)
+    item.setProperty("IsPlayable", "true")
+    if art:
+        item.setArt(art)
+    if info:
+        item.setInfo("video", info)
+    xbmcplugin.addDirectoryItem(
+        handle=ADDON_HANDLE,
+        url=build_url(**target_query),
+        listitem=item,
+        isFolder=False,
+    )
+
+
+def parse_page_count(page_html):
+    match = re.search(r"Page\s+1\s+of\s+(\d+)", page_html, re.IGNORECASE)
+    return int(match.group(1)) if match else 1
+
+
+def fetch_all_pages(first_url, next_url_builder):
+    progress = xbmcgui.DialogProgress()
+    progress.create("HDMozi", "Találatok betöltése...")
+    pages = []
+    try:
+        first_page = request_text(first_url)
+        pages.append(first_page)
+        total_pages = parse_page_count(first_page)
+
+        for page_index in range(2, total_pages + 1):
+            percent = int(((page_index - 1) / float(max(total_pages, 1))) * 100)
+            progress.update(percent, "Oldal {} / {}".format(page_index - 1, total_pages))
+            if progress.iscanceled():
+                break
+            pages.append(request_text(next_url_builder(page_index)))
+    finally:
+        progress.close()
+    return pages
+
+
+def parse_search_results(page_html):
+    results = []
+    pattern = re.compile(
+        r"<div class=\"result-item\">\s*<article>(.*?)</article>\s*</div>",
+        re.DOTALL,
+    )
+    for block in pattern.findall(page_html):
+        link_match = re.search(r'<a href="([^"]+)"', block)
+        title_match = re.search(r'<div class="title">\s*<a [^>]+>(.*?)</a>', block, re.DOTALL)
+        image_match = re.search(r'<img src="([^"]+)"', block)
+        plot_match = re.search(r'<div class="contenido">.*?<p>(.*?)</p>', block, re.DOTALL)
+        if not link_match or not title_match:
+            continue
+        url = link_match.group(1)
+        results.append({
+            "label": strip_tags(title_match.group(1)),
+            "url": url,
+            "thumb": normalize_url(image_match.group(1)) if image_match else "",
+            "plot": strip_tags(plot_match.group(1)) if plot_match else "",
+            "kind": "tvshow" if "/tvshows/" in url else "movie",
+        })
+    return results
+
+
+def parse_category_results(page_html):
+    results = []
+    pattern = re.compile(
+        r'<article id="post-(\d+)" class="item ([^"]+)">(.*?)</article>',
+        re.DOTALL,
+    )
+    for _, item_class, block in pattern.findall(page_html):
+        link_match = re.search(r'<a href="([^"]+)"', block)
+        title_match = re.search(r'<img [^>]*alt="([^"]+)"', block)
+        image_match = re.search(r'<img src="([^"]+)"', block)
+        if not link_match or not title_match:
+            continue
+        results.append({
+            "label": html.unescape(title_match.group(1)).strip(),
+            "url": link_match.group(1),
+            "thumb": normalize_url(image_match.group(1)) if image_match else "",
+            "kind": "tvshow" if "tvshows" in item_class else "movie",
+        })
+    return results
+
+
+def parse_categories(page_html):
+    categories = {}
+    for href, name in re.findall(r'href="(https://hdmozi\.hu/genre/[^\"]+/)"[^>]*>([^<]+)</a>', page_html):
+        slug = href.rstrip("/").split("/")[-1]
+        clean_name = html.unescape(name).strip()
+        if not clean_name:
+            continue
+        categories[slug] = {"name": clean_name, "url": href}
+    return sorted(categories.values(), key=lambda item: item["name"].lower())
+
+
+def parse_movie_sources(page_html):
+    sources = []
+    pattern = re.compile(
+        r"<li id='player-option-([^']+)' class='dooplay_player_option' data-type='([^']+)' data-post='(\d+)' data-nume='([^']+)'>(.*?)</li>",
+        re.DOTALL,
+    )
+    for _, source_type, post_id, nume, block in pattern.findall(page_html):
+        if nume == "trailer":
+            continue
+        title_match = re.search(r"<span class='title'>(.*?)</span>", block, re.DOTALL)
+        title = strip_tags(title_match.group(1)) if title_match else "Lejátszás"
+        sources.append({
+            "label": title,
+            "source_type": source_type,
+            "post_id": post_id,
+            "nume": nume,
+        })
+    return sources
+
+
+def parse_show_episodes(page_html):
+    episodes = []
+    episode_pattern = re.compile(
+        r"<li class='mark-\d+'.*?<div class='numerando'>(.*?)</div>.*?<div class='episodiotitle'><a href='([^']+)'>(.*?)</a>.*?</li>",
+        re.DOTALL,
+    )
+    for numbering, url, title in episode_pattern.findall(page_html):
+        episodes.append({
+            "label": "{} - {}".format(strip_tags(numbering), strip_tags(title)),
+            "url": url,
+        })
+    return episodes
+
+
+def parse_detail_metadata(page_html):
+    title_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, re.DOTALL)
+    plot_match = re.search(r'<div itemprop="description" class="wp-content">\s*<p>(.*?)</p>', page_html, re.DOTALL)
+    poster_match = re.search(r'<div class="poster">\s*<img [^>]*src="([^"]+)"', page_html, re.DOTALL)
+    return {
+        "title": strip_tags(title_match.group(1)) if title_match else "",
+        "plot": strip_tags(plot_match.group(1)) if plot_match else "",
+        "poster": normalize_url(poster_match.group(1)) if poster_match else "",
+    }
+
+
+def prompt_search():
+    keyboard = xbmc.Keyboard("", "Keresés")
+    keyboard.doModal()
+    if not keyboard.isConfirmed():
+        xbmcplugin.endOfDirectory(ADDON_HANDLE, succeeded=False)
+        return
+    query = keyboard.getText().strip()
+    if not query:
+        xbmcplugin.endOfDirectory(ADDON_HANDLE, succeeded=False)
+        return
+    remember_search(query)
+    xbmc.executebuiltin("Container.Update({})".format(build_url(action="search_results", query=query)))
+    xbmcplugin.endOfDirectory(ADDON_HANDLE, succeeded=False)
+
+
+def list_root():
+    add_directory_item("hdmozi.hu", {"action": "home"})
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def list_home():
+    add_directory_item("Keresés", {"action": "prompt_search"}, is_folder=False)
+    add_directory_item("Mentett keresések", {"action": "saved_searches"})
+    add_directory_item("Kategóriák", {"action": "categories"})
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def list_saved_searches():
+    searches = load_saved_searches()
+    for query in searches:
+        add_directory_item(
+            query,
+            {"action": "search_results", "query": query},
+            context=[(
+                "Törlés a mentett keresésekből",
+                "RunPlugin({})".format(build_url(action="delete_saved_search", query=query)),
+            )],
+        )
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def run_search_results(query):
+    pages = fetch_all_pages(
+        "{}/?s={}".format(SITE_URL, urllib.parse.quote_plus(query)),
+        lambda page: "{}/page/{}/?s={}".format(SITE_URL, page, urllib.parse.quote_plus(query)),
+    )
+    for result in [item for page in pages for item in parse_search_results(page)]:
+        add_result_item(result)
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def list_categories():
+    categories = parse_categories(request_text(SITE_URL + "/?s=halo"))
+    for category in categories:
+        add_directory_item(category["name"], {
+            "action": "category_results",
+            "name": category["name"],
+            "url": category["url"],
+        })
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def run_category_results(name, category_url):
+    base = category_url.rstrip("/")
+    pages = fetch_all_pages(base + "/", lambda page: "{}/page/{}/".format(base, page))
+    for result in [item for page in pages for item in parse_category_results(page)]:
+        add_result_item(result)
+    xbmcplugin.setPluginCategory(ADDON_HANDLE, name)
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def add_result_item(result):
+    info = {"title": result["label"], "plot": result.get("plot", "")}
+    art = {"thumb": result.get("thumb", ""), "poster": result.get("thumb", "")}
+    if result["kind"] == "tvshow":
+        add_directory_item(result["label"], {"action": "show_detail", "url": result["url"]}, art=art, info=info)
+    else:
+        add_directory_item(result["label"], {"action": "movie_detail", "url": result["url"]}, art=art, info=info)
+
+
+def list_movie_detail(url):
+    page_html = request_text(url)
+    meta = parse_detail_metadata(page_html)
+    art = {"thumb": meta["poster"], "poster": meta["poster"]}
+    info = {"title": meta["title"], "plot": meta["plot"]}
+    for source in parse_movie_sources(page_html):
+        add_playable_item(source["label"], {
+            "action": "play_source",
+            "post_id": source["post_id"],
+            "source_type": source["source_type"],
+            "nume": source["nume"],
+            "page_url": url,
+        }, art=art, info=info)
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def list_show_detail(url):
+    page_html = request_text(url)
+    meta = parse_detail_metadata(page_html)
+    art = {"thumb": meta["poster"], "poster": meta["poster"]}
+    info = {"tvshowtitle": meta["title"], "plot": meta["plot"]}
+    for episode in parse_show_episodes(page_html):
+        add_directory_item(episode["label"], {
+            "action": "episode_detail",
+            "url": episode["url"],
+        }, art=art, info=info)
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def list_episode_detail(url):
+    page_html = request_text(url)
+    meta = parse_detail_metadata(page_html)
+    art = {"thumb": meta["poster"], "poster": meta["poster"]}
+    info = {"title": meta["title"], "plot": meta["plot"]}
+    for source in parse_movie_sources(page_html):
+        add_playable_item(source["label"], {
+            "action": "play_source",
+            "post_id": source["post_id"],
+            "source_type": source["source_type"],
+            "nume": source["nume"],
+            "page_url": url,
+        }, art=art, info=info)
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def resolve_admin_ajax_source(post_id, source_type, nume):
+    response = request_json(
+        SITE_URL + "/wp-admin/admin-ajax.php",
+        data={
+            "action": "doo_player_ajax",
+            "post": post_id,
+            "nume": nume,
+            "type": source_type,
+        },
+    )
+    return normalize_url(response.get("embed_url"))
+
+
+def rc4_decrypt(cipher_text, key):
+    s = list(range(256))
+    j = 0
+    out = []
+    key_length = len(key)
+
+    for i in range(256):
+        j = (j + s[i] + ord(key[i % key_length])) % 256
+        s[i], s[j] = s[j], s[i]
+
+    i = 0
+    j = 0
+    for byte in cipher_text:
+        i = (i + 1) % 256
+        j = (j + s[i]) % 256
+        s[i], s[j] = s[j], s[i]
+        out.append(byte ^ s[(s[i] + s[j]) % 256])
+
+    return bytes(out).decode("utf-8", "replace")
+
+
+def resolve_videa(player_url):
+    player_html = request_text(player_url)
+    nonce_match = re.search(r'_xt\s*=\s*"([^"]+)"', player_html)
+    if not nonce_match:
+        raise ValueError("A Videa nonce nem található")
+
+    nonce = nonce_match.group(1)
+    left = nonce[:32]
+    right = nonce[32:]
+    result = ""
+    for index in range(32):
+        result += right[index - (VIDEA_STATIC_SECRET.index(left[index]) - 31)]
+
+    parsed = urllib.parse.urlparse(player_url)
+    query = dict(urllib.parse.parse_qsl(parsed.query))
+    if "f" not in query and "v" not in query:
+        raise ValueError("A Videa azonosító nem található")
+    random_seed = "".join(random.choice(string.ascii_letters + string.digits) for _ in range(8))
+    query["_s"] = random_seed
+    query["_t"] = result[:16]
+    query["platform"] = "desktop"
+
+    xml_text, headers = request_text(
+        "https://videa.hu/player/xml?{}".format(urllib.parse.urlencode(query)),
+        headers={"Referer": player_url},
+        return_headers=True,
+    )
+
+    if xml_text.startswith("<?xml"):
+        xml_payload = xml_text
+    else:
+        rc4_key = result[16:] + random_seed + headers.get("x-videa-xs", "")
+        xml_payload = rc4_decrypt(base64.b64decode(xml_text), rc4_key)
+
+    error_url_match = re.search(r"<error[^>]*>(https://videa\.hu/[^<]+)</error>", xml_payload)
+    if error_url_match:
+        error_page_url = normalize_url(error_url_match.group(1))
+        error_page_html = request_text(error_page_url, headers={"Referer": player_url})
+        iframe_match = re.search(r'id="videa_player_iframe"[^>]+src="([^"]+)"', error_page_html)
+        if iframe_match:
+            iframe_url = urllib.parse.urljoin(error_page_url, html.unescape(iframe_match.group(1)))
+            if iframe_url != player_url:
+                return resolve_videa(iframe_url)
+
+    formats = []
+    for name, expires, source_url in re.findall(
+        r'video_source\s*name="([^"]+)"[^>]*exp="([^"]+)"[^>]*>([^<]+)',
+        xml_payload,
+    ):
+        hash_match = re.search(r"<hash_value_{}>([^<]+)<".format(re.escape(name)), xml_payload)
+        hash_value = hash_match.group(1) if hash_match else None
+        if hash_value and expires:
+            separator = "&" if "?" in source_url else "?"
+            source_url = "{}{}md5={}&expires={}".format(source_url, separator, hash_value, expires)
+        height_match = re.search(
+            r'video_source\s*name="{}"[^>]*height="(\d+)"'.format(re.escape(name)),
+            xml_payload,
+        )
+        formats.append({
+            "url": normalize_url(source_url).replace("&amp;", "&"),
+            "height": int(height_match.group(1)) if height_match else 0,
+        })
+
+    if not formats:
+        root = ET.fromstring(xml_payload)
+        video = root.find("./video")
+        if video is None:
+            raise ValueError("A Videa videóinformáció nem található")
+
+        sources = root.find("./video_sources")
+        hashes = root.find("./hash_values")
+        for source in sources.findall("./video_source") if sources is not None else []:
+            source_url = source.text or ""
+            name = source.get("name")
+            expires = source.get("exp")
+            hash_value = hashes.findtext("hash_value_{}".format(name)) if hashes is not None else None
+            if hash_value and expires:
+                separator = "&" if "?" in source_url else "?"
+                source_url = "{}{}md5={}&expires={}".format(source_url, separator, hash_value, expires)
+            formats.append({
+                "url": normalize_url(source_url).replace("&amp;", "&"),
+                "height": int(source.get("height") or 0),
+            })
+
+    if not formats:
+        raise ValueError("A Videa források nem találhatók")
+
+    best = sorted(formats, key=lambda item: item["height"], reverse=True)[0]
+    return {"url": best["url"]}
+
+
+def rpm_char_codes(*codes):
+    return "".join(chr(int(code)) for code in codes)
+
+
+def rpm_key(protocol):
+    number = str(ord("ᵟ"))
+    output = ""
+    for digit in number:
+        output += rpm_char_codes("10" + digit)
+    output += rpm_char_codes(ord(protocol[1]))
+    output += output[1:3]
+    output += rpm_char_codes(110, 109, 117)
+    seq = list("3579")
+    output += rpm_char_codes(seq[3] + seq[2], seq[1] + seq[2])
+    output += rpm_char_codes(int(seq[0]) + 1 + int(seq[3]), int(seq[0]) + 1 + int(seq[3]))
+    output += rpm_char_codes(int(seq[3]) * 10 + int(seq[3]), "".join(reversed(seq))[:2])
+    return output.encode("utf-8")
+
+
+def rpm_iv(protocol, fragment):
+    proto_sep = protocol + "//"
+    length_product = len(protocol) * len(proto_sep)
+    output = ""
+    for value in range(1, 10):
+        output += rpm_char_codes(value + length_product)
+    se = "111"
+    output += rpm_char_codes(
+        length_product,
+        se,
+        len(se) * ord(fragment[0]),
+        int(se) + len(protocol),
+        int(se) + len(protocol) + 4,
+        ord(protocol[1]),
+        ord(protocol[1]) - 2,
+    )
+    return output.encode("utf-8")
+
+
+def rpm_decrypt(hex_text, protocol, fragment):
+    encrypted = binascii.unhexlify(hex_text.strip())
+    data = decrypt_cbc(encrypted, rpm_key(protocol), rpm_iv(protocol, fragment))
+    text = data.decode("utf-8", "replace").strip()
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start:end + 1]
+    try:
+        return json.loads(text)
+    except ValueError:
+        log("rpm_decrypt raw head: {}".format(text[:400].encode("unicode_escape").decode("ascii")))
+        normalized = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', text)
+        normalized = normalized.replace("'", '"')
+        normalized = re.sub(r",\s*}", "}", normalized)
+        normalized = re.sub(r",\s*]", "]", normalized)
+        log("rpm_decrypt normalized head: {}".format(normalized[:400].encode("unicode_escape").decode("ascii")))
+        return json.loads(normalized)
+
+
+def resolve_rpmshare_with_node(embed_url):
+    node_bin = shutil.which("node")
+    if not node_bin:
+        raise RuntimeError("A Node.js nem található a rpmshare feloldásához")
+
+    script = r'''
+const https = require("https");
+const crypto = require("crypto");
+
+function fetch(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => data += chunk);
+      res.on("end", () => resolve(data));
+    }).on("error", reject);
+  });
+}
+
+function g(...codes) {
+  return String.fromCodePoint(...codes.map((c) => parseInt(c, 10)));
+}
+
+function x(str, idx) {
+  return str.charCodeAt(idx || 0) || 0;
+}
+
+function b(str) {
+  return new TextEncoder().encode(str);
+}
+
+function t(buf) {
+  return new TextDecoder().decode(buf);
+}
+
+function makeKey(protocol) {
+  const I = "10", k = 110, B = 1;
+  let M = "";
+  const chars = x("\u1d5f").toString().split("");
+  for (let i = 0; i < chars.length; i++) M += g(I + chars[i]);
+  M += g(x(protocol, I / 10));
+  M += M.slice(1, 3);
+  M += g(k, k - 1, k + 7);
+  const seq = "3579".split("");
+  M += g(seq[3] + seq[2], seq[1] + seq[2]);
+  M += g(seq[0] * B + B + seq[3], seq[0] * B + B + seq[3]);
+  M += g(seq[3] * I + seq[3] * B, seq.reverse().join("").slice(0, 2));
+  return b(M);
+}
+
+function makeIv(protocol, hash) {
+  const protoSep = protocol + "//";
+  const B = protocol.length * protoSep.length;
+  const M = 1;
+  let out = "";
+  for (let i = M; i < 10; i++) out += g(i + B);
+  let se = "";
+  se = M + se + M + se + M;
+  const ce = se.length * x(hash);
+  const Be = se * M + protocol.length;
+  const P = Be + 4;
+  const Z = x(protocol, M);
+  const Ae = Z * M - 2;
+  out += g(B, se, ce, Be, P, Z, Ae);
+  return b(out);
+}
+
+(async () => {
+  const embed = process.argv[2];
+  const u = new URL(embed);
+  const protocol = u.protocol;
+  const hash = u.hash;
+  const api = `${u.origin}/api/v1/video?id=${hash.slice(1)}&w=1920&h=1080&r=hdmozi.hu`;
+  const hex = await fetch(api, {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": embed,
+    "Accept-Language": "hu-HU,hu;q=0.9,en;q=0.8"
+  });
+  const decipher = crypto.createDecipheriv("aes-128-cbc", makeKey(protocol), makeIv(protocol, hash));
+  let plain = decipher.update(Buffer.from(hex.trim(), "hex"));
+  plain = Buffer.concat([plain, decipher.final()]);
+  process.stdout.write(t(plain));
+})().catch((err) => {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+'''
+
+    script_path = os.path.join(PROFILE_DIR, "rpmshare_resolver.js")
+    ensure_profile_dir()
+    with open(script_path, "w", encoding="utf-8") as handle:
+        handle.write(script)
+
+    startupinfo = None
+    creationflags = 0
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    output = subprocess.check_output(
+        [node_bin, script_path, embed_url],
+        stderr=subprocess.STDOUT,
+        startupinfo=startupinfo,
+        creationflags=creationflags,
+    )
+    return json.loads(output.decode("utf-8", "replace"))
+
+
+def resolve_rpmshare(embed_url):
+    parsed = urllib.parse.urlparse(embed_url)
+    origin = "{}://{}".format(parsed.scheme, parsed.netloc)
+    payload = resolve_rpmshare_with_node(embed_url)
+    order = payload.get("streamingConfig")
+    raw_order = payload.get("streamingConfigRaw")
+
+    config = {"order": ["Cloudflare", "Tiktok"], "adjust": {}}
+    if raw_order and isinstance(raw_order, str) and "::" in raw_order:
+        token, expiry = raw_order.split("::", 1)
+        config["adjust"]["Cloudflare"] = {"params": {"t": token, "e": expiry}}
+    if order:
+        try:
+            parsed_config = json.loads(order)
+            if isinstance(parsed_config, dict) and isinstance(parsed_config.get("order"), list):
+                config = parsed_config
+                config.setdefault("adjust", {})
+        except ValueError:
+            pass
+
+    direct_source = payload.get("source")
+    if direct_source:
+        return {
+            "url": normalize_url(direct_source),
+            "headers": {
+                "Referer": embed_url,
+                "Origin": origin,
+                "User-Agent": USER_AGENT,
+            },
+        }
+
+    source_map = {
+        "In-House": payload.get("source"),
+        "Google": payload.get("hlsVideoGoogle"),
+        "Tiktok": payload.get("tt"),
+        "Cloudflare": payload.get("cf"),
+    }
+
+    preferred_order = ["In-House", "Google", "Tiktok", "Cloudflare"]
+    configured_order = config.get("order", [])
+    merged_order = preferred_order + [name for name in configured_order if name not in preferred_order]
+
+    for source_name in merged_order:
+        source_url = source_map.get(source_name)
+        if not source_url:
+            continue
+        normalized_source = urllib.parse.urljoin(origin + "/", normalize_url(source_url))
+        parsed_source = urllib.parse.urlparse(normalized_source)
+        source_query = dict(urllib.parse.parse_qsl(parsed_source.query))
+        adjust = config.get("adjust", {}).get(source_name, {})
+        source_query.update(adjust.get("params", {}))
+        final_url = urllib.parse.urlunparse((
+            parsed_source.scheme,
+            parsed_source.netloc,
+            parsed_source.path,
+            parsed_source.params,
+            urllib.parse.urlencode(source_query),
+            parsed_source.fragment,
+        ))
+        return {
+            "url": final_url,
+            "headers": {
+                "Referer": embed_url,
+                "Origin": origin,
+                "User-Agent": USER_AGENT,
+            },
+        }
+
+    raise ValueError("Az RPMStream forrás nem található")
+
+
+def resolve_okru(embed_url):
+    match = re.search(r"/(?:videoembed|video|live)/(\d+)", embed_url)
+    if not match:
+        raise ValueError("Az OK.ru azonosító nem található")
+
+    media_id = match.group(1)
+    metadata = request_json(
+        "http://www.ok.ru/dk?cmd=videoPlayerMetadata",
+        data={"mid": media_id},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": embed_url,
+        },
+    )
+
+    hls_url = metadata.get("hlsManifestUrl")
+    stream_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+        "Referer": embed_url,
+    }
+    if hls_url:
+        return {"url": normalize_url(hls_url), "headers": stream_headers}
+
+    quality_map = {"ultra": 2160, "quad": 1440, "full": 1080, "hd": 720, "sd": 480, "low": 360, "lowest": 240, "mobile": 144}
+    formats = []
+    for entry in metadata.get("videos", []):
+        source_url = entry.get("url")
+        if not source_url:
+            continue
+        formats.append({
+            "url": normalize_url(source_url),
+            "height": quality_map.get((entry.get("name") or "").lower(), 0),
+        })
+
+    if not formats:
+        raise ValueError("Az OK.ru forrás nem található")
+
+    best = sorted(formats, key=lambda item: item["height"], reverse=True)[0]
+    return {"url": best["url"], "headers": stream_headers}
+
+
+def resolve_vk(embed_url):
+    parsed = urllib.parse.urlparse(embed_url)
+    host = parsed.netloc
+    ref = "https://{}/".format(host)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": ref,
+        "Origin": ref[:-1],
+    }
+
+    media_id = parsed.query if parsed.path.endswith("video_ext.php") else parsed.path.strip("/")
+    query = urllib.parse.parse_qs(media_id)
+    oid = ""
+    video_id = ""
+    video_list = ""
+    if "oid" in query and "id" in query:
+        oid = query["oid"][0]
+        video_id = query["id"][0]
+        video_list = query.get("list", [""])[0]
+    elif "_" in media_id:
+        oid, video_id = media_id.split("_", 1)
+        if "list=" in media_id:
+            video_id, video_list = video_id.split("list=", 1)
+            video_id = video_id.rstrip("?&")
+    else:
+        raise ValueError("A VK azonosító nem található")
+
+    oid = oid.replace("video", "")
+    ajax_headers = dict(headers)
+    ajax_headers["X-Requested-With"] = "XMLHttpRequest"
+    payload_text = request_text(
+        "https://{}/al_video.php?act=show".format(host),
+        data={
+            "act": "show",
+            "al": 1,
+            "video": "{}_{}".format(oid, video_id),
+            "list": video_list,
+            "load_playlist": 1 if video_list else "",
+            "module": "direct" if video_list else "",
+            "show_next": 1 if video_list else "",
+            "playlist_id": "{}_-2".format(oid) if video_list else "",
+        },
+        headers=ajax_headers,
+    )
+
+    if payload_text.startswith("<!--"):
+        payload_text = payload_text[4:]
+    payload_json = json.loads(payload_text)
+    player_data = {}
+    for item in payload_json.get("payload", []):
+        if isinstance(item, list):
+            for nested in item:
+                if isinstance(nested, dict) and nested.get("player"):
+                    player_data = nested.get("player", {}).get("params", [{}])[0]
+
+    if not player_data:
+        page_html = request_text(embed_url, headers=headers)
+        match = re.search(r"var\s*playerParams\s*=\s*(.+?});", page_html)
+        if match:
+            fallback_data = json.loads(match.group(1))
+            player_data = fallback_data.get("params", [{}])[0]
+
+    formats = []
+    for key, value in player_data.items():
+        if key.startswith("url") and value:
+            try:
+                height = int(key[3:])
+            except ValueError:
+                height = 0
+            formats.append({"url": normalize_url(value), "height": height})
+
+    hls_url = player_data.get("hls") or player_data.get("hls_live") or player_data.get("hls_ondemand")
+    if hls_url:
+        return {"url": normalize_url(hls_url), "headers": headers}
+
+    if not formats:
+        raise ValueError("A VK forrás nem található")
+
+    best = sorted(formats, key=lambda item: item["height"], reverse=True)[0]
+    return {"url": best["url"], "headers": headers}
+
+
+def resolve_youtube(embed_url):
+    match = re.search(r"/(?:embed/|watch\?v=)([A-Za-z0-9_-]{11})", embed_url)
+    if not match:
+        raise ValueError("A YouTube azonosító nem található")
+    return {"url": "plugin://plugin.video.youtube/play/?video_id={}".format(match.group(1))}
+
+
+def build_header_string(headers):
+    return "&".join(
+        "{}={}".format(urllib.parse.quote_plus(key), urllib.parse.quote_plus(value))
+        for key, value in headers.items()
+    )
+
+
+def resolve_embed_url(embed_url):
+    if not embed_url:
+        raise ValueError("Üres embed URL")
+    embed_url = normalize_url(embed_url)
+
+    if "youtube.com/" in embed_url or "youtu.be/" in embed_url:
+        return resolve_youtube(embed_url)
+    if embed_url.endswith(".m3u8") or ".m3u8?" in embed_url or embed_url.endswith(".mp4"):
+        return {"url": embed_url}
+    if "videa.hu/player" in embed_url:
+        return resolve_videa(embed_url)
+    if "rpmshare.rpmstream.live" in embed_url:
+        return resolve_rpmshare(embed_url)
+    if "ok.ru/" in embed_url or "odnoklassniki.ru/" in embed_url:
+        return resolve_okru(embed_url)
+    if "vk.com/" in embed_url or "vkvideo.ru/" in embed_url:
+        return resolve_vk(embed_url)
+
+    try:
+        import resolveurl
+
+        resolved = resolveurl.resolve(embed_url)
+        if resolved:
+            return {"url": resolved}
+    except Exception as exc:
+        log("resolveurl fallback failed: {}".format(exc))
+
+    raise ValueError("A forrás nem oldható fel: {}".format(embed_url))
+
+
+def play_source(post_id, source_type, nume):
+    try:
+        embed_url = resolve_admin_ajax_source(post_id, source_type, nume)
+        resolved = resolve_embed_url(embed_url)
+        stream_url = resolved["url"]
+        headers = resolved.get("headers") or {}
+        item_path = stream_url
+        if headers:
+            header_string = build_header_string(headers)
+            item_path = stream_url + "|" + header_string
+        item = xbmcgui.ListItem(path=item_path)
+        if ".m3u8" in resolved["url"]:
+            header_string = build_header_string(headers)
+            item.setMimeType("application/vnd.apple.mpegurl")
+            item.setContentLookup(False)
+            item.setProperty("inputstream", "inputstream.adaptive")
+            item.setProperty("inputstream.adaptive.manifest_type", "hls")
+            if header_string:
+                item.setProperty("inputstream.adaptive.manifest_headers", header_string)
+                item.setProperty("inputstream.adaptive.stream_headers", header_string)
+        xbmcplugin.setResolvedUrl(ADDON_HANDLE, True, item)
+    except Exception as exc:
+        log("play_source failed: {}\n{}".format(exc, traceback.format_exc()))
+        xbmcgui.Dialog().notification("HDMozi", str(exc), xbmcgui.NOTIFICATION_ERROR, 5000)
+        xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+
+
+def router(params):
+    action = params.get("action")
+
+    if not action:
+        list_root()
+        return
+    if action == "prompt_search":
+        prompt_search()
+        return
+    if action == "home":
+        list_home()
+        return
+    if action == "saved_searches":
+        list_saved_searches()
+        return
+    if action == "search_results":
+        run_search_results(params.get("query", ""))
+        return
+    if action == "delete_saved_search":
+        delete_saved_search(params.get("query", ""))
+        xbmc.executebuiltin("Container.Refresh")
+        return
+    if action == "categories":
+        list_categories()
+        return
+    if action == "category_results":
+        run_category_results(params.get("name", "Kategória"), params.get("url", SITE_URL))
+        return
+    if action == "movie_detail":
+        list_movie_detail(params["url"])
+        return
+    if action == "show_detail":
+        list_show_detail(params["url"])
+        return
+    if action == "episode_detail":
+        list_episode_detail(params["url"])
+        return
+    if action == "play_source":
+        play_source(params["post_id"], params["source_type"], params["nume"])
+        return
+
+    xbmcgui.Dialog().notification("HDMozi", "Ismeretlen művelet", xbmcgui.NOTIFICATION_ERROR, 3000)
+
+
+if __name__ == "__main__":
+    router(dict(urllib.parse.parse_qsl(sys.argv[2][1:])))

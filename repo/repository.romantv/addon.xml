@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="repository.romantv" name="RomanTV Repository" version="1.0.0" provider-name="RomanTV">
+    <extension point="xbmc.addon.repository" name="RomanTV Repository">
+        <dir>
+            <info compressed="false">https://trn02.github.io/repository.romantv/repo/addons.xml</info>
+            <checksum>https://trn02.github.io/repository.romantv/repo/addons.xml.md5</checksum>
+            <datadir zip="true">https://trn02.github.io/repository.romantv/repo/</datadir>
+        </dir>
+    </extension>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="hu_HU">RomanTV Kodi tároló</summary>
+        <description lang="hu_HU">RomanTV Kodi repository GitHub Pages kiszolgálással.</description>
+        <platform>all</platform>
+        <assets>
+            <icon>icon.png</icon>
+            <fanart>fanart.jpg</fanart>
+        </assets>
+    </extension>
+</addon>
