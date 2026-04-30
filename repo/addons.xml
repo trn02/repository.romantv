@@ -21,11 +21,10 @@
 
 <addon id="plugin.video.hdmozi"
        name="Román TV"
-       version="1.0.3"
+       version="1.0.4"
        provider-name="OpenCode">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
-        <import addon="script.module.resolveurl" />
     </requires>
     <extension point="xbmc.python.pluginsource" library="default.py">
         <provides>video</provides>
