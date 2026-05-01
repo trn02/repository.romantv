@@ -235,10 +235,13 @@ def parse_seasons(page_html):
 
 def parse_episode_rows(page_html):
     episodes = []
-    row_pattern = re.compile(r'<tr>.*?<td class="align-middle">(\d+\. epizód)</td>.*?<td class="align-middle">(\d+\. rész)</td>.*?wire:click="getLinks\((\d+),\s*(\d+),\s*(\d+)\)"', re.DOTALL)
-    for ep_label, part_label, idx, episode_id, series_id in row_pattern.findall(page_html):
+    row_pattern = re.compile(
+        r'<tr>.*?<td class="align-middle">(.*?)</td>.*?<td class="align-middle">(\d+\. rész)</td>.*?wire:click="getLinks\((\d+),\s*(\d+),\s*(\d+)\)"',
+        re.DOTALL,
+    )
+    for name_label, part_label, idx, episode_id, series_id in row_pattern.findall(page_html):
         episodes.append({
-            "label": "{} - {}".format(ep_label, part_label),
+            "label": "{} - {}".format(strip_tags(name_label), part_label),
             "episode_index": idx,
             "episode_id": episode_id,
             "series_id": series_id,
