@@ -805,7 +805,49 @@ def resolve_sbot(embed_url):
     final_url = normalize_url(final_url)
     if final_url == redirect_url or final_url == embed_url:
         raise ValueError("Az sbot.cf nem adott vissza lejátszható linket")
+    if "sorozatok.net/watch.php" in final_url:
+        watch_html = request_text(final_url, headers={"Referer": embed_url})
+        iframe_match = re.search(r'<iframe[^>]+src="([^"]*embed\.php[^\"]+)"', watch_html)
+        if iframe_match:
+            return {"url": normalize_url(urllib.parse.urljoin(final_url, iframe_match.group(1)))}
     return resolve_embed_url(final_url)
+
+
+def resolve_filemoon(embed_url):
+    parsed = urllib.parse.urlparse(embed_url)
+    match = re.search(r"/(?:d|e)/([A-Za-z0-9]+)", parsed.path)
+    if not match:
+        raise ValueError("A Filemoon azonosító nem található")
+    code = match.group(1)
+
+    api_url = "https://filemoon.sx/api/videos/{}/embed/playback".format(code)
+    req = urllib.request.Request(
+        api_url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": "https://filemoon.sx/e/{}".format(code),
+            "Origin": "https://filemoon.sx",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as response:
+        payload_text = response.read().decode("utf-8", "replace")
+
+    payload = json.loads(payload_text)
+    sources = payload.get("sources") or payload.get("data", {}).get("sources") or []
+    if not sources:
+        raise ValueError("A Filemoon forrás nem található")
+
+    def sort_key(item):
+        mime = (item.get("mime_type") or "").lower()
+        if "mpegurl" in mime or ".m3u8" in item.get("url", ""):
+            return 3
+        if "mp4" in mime:
+            return 2
+        return 1
+
+    best = sorted(sources, key=sort_key, reverse=True)[0]
+    return {"url": normalize_url(best.get("url", ""))}
 
 
 def resolve_youtube(embed_url):
@@ -841,6 +883,8 @@ def resolve_embed_url(embed_url):
         return resolve_vk(embed_url)
     if "sbot.cf/" in embed_url:
         return resolve_sbot(embed_url)
+    if "filemoon.sx/" in embed_url:
+        return resolve_filemoon(embed_url)
 
     try:
         import resolveurl
