@@ -13,6 +13,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import xbmc
 import xbmcaddon
@@ -35,6 +36,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 VIDEA_STATIC_SECRET = "xHb0ZvME5q8CBcoQi6AngerDu3FGO9fkUlwPmLVY_RTzj2hJIS4NasXWKy1td7p"
+
+VENDOR_DIR = Path(__file__).resolve().parent / "resources" / "lib" / "vendor"
+if str(VENDOR_DIR) not in sys.path:
+    sys.path.insert(0, str(VENDOR_DIR))
 
 sorozatcc.configure(
     base_url=BASE_URL,
