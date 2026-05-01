@@ -568,7 +568,7 @@ def router(params):
     action = params.get("action", "")
     if action.startswith(ACTION_PREFIX):
         action = action[len(ACTION_PREFIX):]
-    if not action:
+    if not action or action == "root":
         list_root()
         return
     if action == "prompt_search":
