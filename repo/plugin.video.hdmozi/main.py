@@ -311,6 +311,7 @@ def prompt_search():
 
 def list_root():
     add_directory_item("hdmozi.hu", {"action": "home"})
+    add_directory_item("Sorozat.cc", {"action": "sc_root"})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
@@ -318,7 +319,6 @@ def list_home():
     add_directory_item("Keresés", {"action": "prompt_search"}, is_folder=False)
     add_directory_item("Mentett keresések", {"action": "saved_searches"})
     add_directory_item("Kategóriák", {"action": "categories"})
-    add_directory_item("Sorozat.cc", {"action": "sc_root"})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
