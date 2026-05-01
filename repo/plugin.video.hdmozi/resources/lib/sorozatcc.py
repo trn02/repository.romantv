@@ -320,6 +320,31 @@ def parse_livewire_response(response_text):
     return snapshot_data, effects
 
 
+def extract_snapshot_links(snapshot_data):
+    results = []
+    links = snapshot_data.get("data", {}).get("links")
+    if not isinstance(links, list):
+        return results
+    for group in links:
+        if not isinstance(group, dict):
+            continue
+        for entries in group.values():
+            if not isinstance(entries, list):
+                continue
+            for wrapped in entries:
+                if not isinstance(wrapped, list):
+                    continue
+                for item in wrapped:
+                    if isinstance(item, dict) and item.get("link"):
+                        results.append({
+                            "url": normalize_url(item.get("link").replace("\\/", "/")),
+                            "quality": item.get("quality") or "?",
+                            "language": item.get("language") or "?",
+                            "storage": item.get("storage") or "?",
+                        })
+    return results
+
+
 def extract_first_iframe(html_text):
     match = re.search(r'<iframe[^>]+src="([^"]+)"', html_text)
     return normalize_url(match.group(1)) if match else ""
@@ -527,15 +552,15 @@ def list_episode_links(page_url, episode_index, episode_id, series_id):
     try:
         response = livewire_call(page_url, "series.episode-links", "getLinks", [int(episode_index), int(episode_id), int(series_id)])
         snapshot_data, effects = parse_livewire_response(response)
-        links = re.findall(r'"link":"(https:\\/\\/[^\"]+)","quality":"([^\"]*)","language":"([^\"]*)","storage":"([^\"]*)"', response)
+        links = extract_snapshot_links(snapshot_data)
         matches = re.findall(r'<iframe[^>]+src="([^"]+)"', effects.get("html", ""))
         if matches:
             for idx, embed in enumerate(matches, 1):
                 add_playable_item("Lejátszás {}".format(idx), {"action": "play_embed", "embed_url": normalize_url(embed)})
         elif links:
-            for idx, (embed, quality, language, storage) in enumerate(links, 1):
-                label = "{} | {} | {} | {}".format(idx, quality or "?", language or "?", storage or "?")
-                add_playable_item(label, {"action": "play_embed", "embed_url": normalize_url(embed.replace('\\/', '/'))})
+            for idx, item in enumerate(links, 1):
+                label = "{} | {} | {} | {}".format(idx, item["quality"], item["language"], item["storage"])
+                add_playable_item(label, {"action": "play_embed", "embed_url": item["url"]})
         else:
             html_blob = effects.get("html", "")
             link_pattern = re.compile(r'(https?://[^\s"\']+)')
