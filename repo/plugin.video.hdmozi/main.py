@@ -784,6 +784,30 @@ def resolve_vk(embed_url):
     return {"url": best["url"], "headers": headers}
 
 
+def resolve_sbot(embed_url):
+    parsed = urllib.parse.urlparse(embed_url)
+    token = dict(urllib.parse.parse_qsl(parsed.query)).get("k")
+    if not token:
+        raise ValueError("Az sbot.cf token nem található")
+
+    redirect_url = "https://sorozatok.net/api/core.php?a=redirect&id={}".format(token)
+    req = urllib.request.Request(
+        redirect_url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": embed_url,
+            "Accept-Language": "hu-HU,hu;q=0.9,en;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as response:
+        final_url = response.geturl()
+
+    final_url = normalize_url(final_url)
+    if final_url == redirect_url or final_url == embed_url:
+        raise ValueError("Az sbot.cf nem adott vissza lejátszható linket")
+    return resolve_embed_url(final_url)
+
+
 def resolve_youtube(embed_url):
     match = re.search(r"/(?:embed/|watch\?v=)([A-Za-z0-9_-]{11})", embed_url)
     if not match:
@@ -815,6 +839,8 @@ def resolve_embed_url(embed_url):
         return resolve_okru(embed_url)
     if "vk.com/" in embed_url or "vkvideo.ru/" in embed_url:
         return resolve_vk(embed_url)
+    if "sbot.cf/" in embed_url:
+        return resolve_sbot(embed_url)
 
     try:
         import resolveurl
