@@ -310,7 +310,7 @@ def prompt_search():
 
 
 def list_root():
-    add_directory_item("hdmozi.hu", {"action": "home"})
+    add_directory_item("hdmozi.hu", {"action": "hd_root"})
     add_directory_item("Sorozat.cc", {"action": "sc_root"})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
@@ -868,7 +868,7 @@ def router(params):
     if action == "prompt_search":
         prompt_search()
         return
-    if action == "home":
+    if action == "hd_root" or action == "home":
         list_home()
         return
     if action == "saved_searches":
