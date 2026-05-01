@@ -21,17 +21,21 @@ ADDON = xbmcaddon.Addon()
 ADDON_HANDLE = int(sys.argv[1])
 BASE_URL = sys.argv[0]
 PROFILE_DIR = xbmcvfs.translatePath(ADDON.getAddonInfo("profile"))
-SEARCHES_FILE = os.path.join(PROFILE_DIR, "saved_searches.json")
+SEARCHES_FILE = os.path.join(PROFILE_DIR, "saved_searches_sorozatcc.json")
 SITE_URL = "https://sorozat.cc"
+ACTION_PREFIX = "sc_"
+EMBED_RESOLVER = None
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 SORT_OPTIONS = {
-    "latest_upload": {"label": "Legfrissebb feltoltes", "params": {"orderBy": "created_at", "sortBy": "DESC"}},
-    "az": {"label": "A - Z", "params": {"orderBy": "title", "sortBy": "ASC"}},
-    "new_links": {"label": "Legujabb link", "params": {"orderBy": "created_at", "sortBy": "DESC", "orderByLinks": "latest"}},
-    "new_playback": {"label": "Uj online lejatszas", "params": {"orderBy": "created_at", "sortBy": "DESC", "orderByLinks": "play"}},
+    "latest_upload": {"label": "Legfrissebb feltöltés", "method": "newestUpload", "params": {"orderBy": "created_at", "sortBy": "DESC"}},
+    "latest_title": {"label": "Legújabb film/sorozat", "method": "related", "params": {}},
+    "most_viewed": {"label": "Legnézettebb", "method": "viewership", "params": {}},
+    "new_links": {"label": "Legújabb link", "method": "newLinks", "params": {"orderBy": "created_at", "sortBy": "DESC", "orderByLinks": "latest"}},
+    "new_playback": {"label": "Új online lejátszás", "method": "newOnlinePlayback", "params": {"orderBy": "created_at", "sortBy": "DESC", "orderByLinks": "play"}},
+    "az": {"label": "A - Z", "method": "orderByNameAsc", "params": {"orderBy": "title", "sortBy": "ASC"}},
 }
 
 
@@ -41,7 +45,24 @@ def ensure_profile_dir():
 
 
 def build_url(**query):
+    if query.get("action") and not query["action"].startswith(ACTION_PREFIX):
+        query["action"] = ACTION_PREFIX + query["action"]
     return "{}?{}".format(BASE_URL, urllib.parse.urlencode(query))
+
+
+def configure(base_url=None, addon_handle=None, profile_dir=None, action_prefix=None, embed_resolver=None):
+    global BASE_URL, ADDON_HANDLE, PROFILE_DIR, SEARCHES_FILE, ACTION_PREFIX, EMBED_RESOLVER
+    if base_url is not None:
+        BASE_URL = base_url
+    if addon_handle is not None:
+        ADDON_HANDLE = addon_handle
+    if profile_dir is not None:
+        PROFILE_DIR = profile_dir
+        SEARCHES_FILE = os.path.join(PROFILE_DIR, "saved_searches_sorozatcc.json")
+    if action_prefix is not None:
+        ACTION_PREFIX = action_prefix
+    if embed_resolver is not None:
+        EMBED_RESOLVER = embed_resolver
 
 
 def log(message):
@@ -94,6 +115,18 @@ def normalize_url(url):
     if url.startswith("//"):
         return "https:" + url
     return url
+
+
+def slugify(text):
+    text = strip_tags(text).lower()
+    replacements = {
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ö": "o", "ő": "o",
+        "ú": "u", "ü": "u", "ű": "u", "ß": "ss",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text or "kategoria"
 
 
 def load_saved_searches():
@@ -171,16 +204,18 @@ def parse_cards(page_html, kind):
 def parse_categories(page_html, base_path):
     results = []
     seen = set()
-    pattern = re.compile(r'href="(https://sorozat\.cc/' + re.escape(base_path) + r'/kategoria/(\d+)/([^"]+))"[^>]*>')
-    for url, category_id, slug in pattern.findall(page_html):
+    pattern = re.compile(r'<input[^>]+wire:model\.live="selectedCategorys"[^>]+value="(\d+)"[^>]*>\s*<label[^>]*>\s*([^<(]+)', re.DOTALL)
+    for category_id, name in pattern.findall(page_html):
         if category_id in seen:
             continue
         seen.add(category_id)
+        clean_name = strip_tags(name)
+        url = "{}/{}/kategoria/{}/{}".format(SITE_URL, base_path, category_id, slugify(clean_name))
         results.append({
             "id": category_id,
-            "slug": slug,
+            "slug": slugify(clean_name),
             "url": url,
-            "name": slug.replace("-", " ").title(),
+            "name": clean_name,
         })
     return results
 
@@ -274,6 +309,15 @@ def livewire_call(page_url, component_name, method, params):
     )
     with opener.open(req, timeout=20) as response:
         return response.read().decode("utf-8", "replace")
+
+
+def parse_livewire_response(response_text):
+    payload = json.loads(response_text)
+    component = payload.get("components", [{}])[0]
+    snapshot = component.get("snapshot", "{}")
+    effects = component.get("effects", {})
+    snapshot_data = json.loads(snapshot) if snapshot else {}
+    return snapshot_data, effects
 
 
 def extract_first_iframe(html_text):
@@ -396,10 +440,25 @@ def list_category(kind, category_url, category_name):
 
 
 def list_sorted(kind, sort_key, category_url, category_name):
-    sort_query = dict(SORT_OPTIONS.get(sort_key, {}).get("params", {}))
+    sort_def = SORT_OPTIONS.get(sort_key, SORT_OPTIONS["latest_upload"])
+    sort_query = dict(sort_def.get("params", {}))
     base_url = category_url or (SITE_URL + ("/sorozatok" if kind == "series" else "/filmek"))
-    page_html = request_text(build_page_url(base_url, 1, sort_query))
-    run_list_page(page_html, kind, category_name or SORT_OPTIONS.get(sort_key, {}).get("label", "Lista"), base_url, sort_query)
+    label = category_name or sort_def.get("label", "Lista")
+    if sort_key in ["latest_upload", "az", "new_links", "new_playback"]:
+        page_html = request_text(build_page_url(base_url, 1, sort_query))
+        run_list_page(page_html, kind, label, base_url, sort_query)
+        return
+    component_name = "series.list-series" if kind == "series" else "movies.movies"
+    response = livewire_call(base_url, component_name, sort_def["method"], [])
+    snapshot_data, effects = parse_livewire_response(response)
+    page_html = effects.get("html", "")
+    query = {
+        "orderBy": snapshot_data.get("data", {}).get("orderBy", ""),
+        "sortBy": snapshot_data.get("data", {}).get("orderByType", ""),
+        "orderByLinks": snapshot_data.get("data", {}).get("orderByLinks", ""),
+    }
+    query = {key: value for key, value in query.items() if value}
+    run_list_page(page_html, kind, label, base_url, query)
 
 
 def list_paged(kind, base_url, query_json, page, name):
@@ -433,7 +492,8 @@ def list_movie_host(page_url, embed_id, title, poster, plot):
     info = {"title": title, "plot": plot}
     try:
         response = livewire_call(page_url, "movies.movie-embed", "selectEmbed", [int(embed_id)])
-        embed_url = extract_first_iframe(response)
+        _, effects = parse_livewire_response(response)
+        embed_url = extract_first_iframe(effects.get("html", ""))
         if embed_url:
             add_playable_item("Lejátszás", {"action": "play_embed", "embed_url": embed_url}, art=art, info=info)
         else:
@@ -466,15 +526,22 @@ def list_season_detail(url):
 def list_episode_links(page_url, episode_index, episode_id, series_id):
     try:
         response = livewire_call(page_url, "series.episode-links", "getLinks", [int(episode_index), int(episode_id), int(series_id)])
-        matches = re.findall(r'<iframe[^>]+src="([^"]+)"', response)
+        snapshot_data, effects = parse_livewire_response(response)
+        links = re.findall(r'"link":"(https:\\/\\/[^\"]+)","quality":"([^\"]*)","language":"([^\"]*)","storage":"([^\"]*)"', response)
+        matches = re.findall(r'<iframe[^>]+src="([^"]+)"', effects.get("html", ""))
         if matches:
             for idx, embed in enumerate(matches, 1):
                 add_playable_item("Lejátszás {}".format(idx), {"action": "play_embed", "embed_url": normalize_url(embed)})
+        elif links:
+            for idx, (embed, quality, language, storage) in enumerate(links, 1):
+                label = "{} | {} | {} | {}".format(idx, quality or "?", language or "?", storage or "?")
+                add_playable_item(label, {"action": "play_embed", "embed_url": normalize_url(embed.replace('\\/', '/'))})
         else:
+            html_blob = effects.get("html", "")
             link_pattern = re.compile(r'(https?://[^\s"\']+)')
             urls = []
-            for embed in link_pattern.findall(response):
-                if any(host in embed for host in ["videa.hu", "ok.ru", "vk.com", "vkvideo.ru", "drive.google.com", "sendvid.com", "rumble.com", "dailymotion.com"]):
+            for embed in link_pattern.findall(html_blob):
+                if any(host in embed for host in ["videa.hu", "ok.ru", "vk.com", "vkvideo.ru", "drive.google.com", "sendvid.com", "rumble.com", "dailymotion.com", "filemoon", "hqq", "dood", "streamz", "sbot", "sbbrisk"]):
                     urls.append(normalize_url(embed))
             for idx, embed in enumerate(dict.fromkeys(urls), 1):
                 add_playable_item("Lejátszás {}".format(idx), {"action": "play_embed", "embed_url": embed})
@@ -486,7 +553,10 @@ def list_episode_links(page_url, episode_index, episode_id, series_id):
 
 def play_embed(embed_url):
     try:
-        item = xbmcgui.ListItem(path=resolve_embed_url(embed_url))
+        resolved_url = EMBED_RESOLVER(embed_url) if EMBED_RESOLVER else resolve_embed_url(embed_url)
+        if isinstance(resolved_url, dict):
+            resolved_url = resolved_url.get("url", "")
+        item = xbmcgui.ListItem(path=resolved_url)
         xbmcplugin.setResolvedUrl(ADDON_HANDLE, True, item)
     except Exception as exc:
         log("play embed failed: {}\n{}".format(exc, traceback.format_exc()))
@@ -495,7 +565,9 @@ def play_embed(embed_url):
 
 
 def router(params):
-    action = params.get("action")
+    action = params.get("action", "")
+    if action.startswith(ACTION_PREFIX):
+        action = action[len(ACTION_PREFIX):]
     if not action:
         list_root()
         return

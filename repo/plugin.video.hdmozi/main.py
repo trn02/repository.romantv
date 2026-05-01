@@ -7,9 +7,7 @@ import json
 import os
 import random
 import re
-import shutil
 import string
-import subprocess
 import sys
 import traceback
 import urllib.parse
@@ -22,7 +20,8 @@ import xbmcgui
 import xbmcplugin
 import xbmcvfs
 
-from resources.lib.aes import decrypt_cbc
+from resources.lib.pyaes import AESModeOfOperationCBC, Decrypter
+from resources.lib import sorozatcc
 
 
 ADDON = xbmcaddon.Addon()
@@ -36,6 +35,14 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 VIDEA_STATIC_SECRET = "xHb0ZvME5q8CBcoQi6AngerDu3FGO9fkUlwPmLVY_RTzj2hJIS4NasXWKy1td7p"
+
+sorozatcc.configure(
+    base_url=BASE_URL,
+    addon_handle=ADDON_HANDLE,
+    profile_dir=PROFILE_DIR,
+    action_prefix="sc_",
+    embed_resolver=lambda url: resolve_embed_url(url),
+)
 
 
 def ensure_profile_dir():
@@ -311,6 +318,7 @@ def list_home():
     add_directory_item("Keresés", {"action": "prompt_search"}, is_folder=False)
     add_directory_item("Mentett keresések", {"action": "saved_searches"})
     add_directory_item("Kategóriák", {"action": "categories"})
+    add_directory_item("Sorozat.cc", {"action": "sc_root"})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
@@ -542,43 +550,17 @@ def rpm_char_codes(*codes):
 
 
 def rpm_key(protocol):
-    number = str(ord("ᵟ"))
-    output = ""
-    for digit in number:
-        output += rpm_char_codes("10" + digit)
-    output += rpm_char_codes(ord(protocol[1]))
-    output += output[1:3]
-    output += rpm_char_codes(110, 109, 117)
-    seq = list("3579")
-    output += rpm_char_codes(seq[3] + seq[2], seq[1] + seq[2])
-    output += rpm_char_codes(int(seq[0]) + 1 + int(seq[3]), int(seq[0]) + 1 + int(seq[3]))
-    output += rpm_char_codes(int(seq[3]) * 10 + int(seq[3]), "".join(reversed(seq))[:2])
-    return output.encode("utf-8")
+    return b"kiemtienmua911ca"
 
 
 def rpm_iv(protocol, fragment):
-    proto_sep = protocol + "//"
-    length_product = len(protocol) * len(proto_sep)
-    output = ""
-    for value in range(1, 10):
-        output += rpm_char_codes(value + length_product)
-    se = "111"
-    output += rpm_char_codes(
-        length_product,
-        se,
-        len(se) * ord(fragment[0]),
-        int(se) + len(protocol),
-        int(se) + len(protocol) + 4,
-        ord(protocol[1]),
-        ord(protocol[1]) - 2,
-    )
-    return output.encode("utf-8")
+    return b"1234567890oiuytr"
 
 
 def rpm_decrypt(hex_text, protocol, fragment):
     encrypted = binascii.unhexlify(hex_text.strip())
-    data = decrypt_cbc(encrypted, rpm_key(protocol), rpm_iv(protocol, fragment))
-    text = data.decode("utf-8", "replace").strip()
+    decrypter = Decrypter(AESModeOfOperationCBC(rpm_key(protocol), rpm_iv(protocol, fragment)))
+    text = (decrypter.feed(encrypted) + decrypter.feed()).decode("utf-8", "replace").strip()
     if not text.startswith("{"):
         start = text.find("{")
         end = text.rfind("}")
@@ -596,118 +578,21 @@ def rpm_decrypt(hex_text, protocol, fragment):
         return json.loads(normalized)
 
 
-def resolve_rpmshare_with_node(embed_url):
-    node_bin = shutil.which("node")
-    if not node_bin:
-        raise RuntimeError("A Node.js nem található a rpmshare feloldásához")
-
-    script = r'''
-const https = require("https");
-const crypto = require("crypto");
-
-function fetch(url, headers = {}) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers }, (res) => {
-      let data = "";
-      res.on("data", (chunk) => data += chunk);
-      res.on("end", () => resolve(data));
-    }).on("error", reject);
-  });
-}
-
-function g(...codes) {
-  return String.fromCodePoint(...codes.map((c) => parseInt(c, 10)));
-}
-
-function x(str, idx) {
-  return str.charCodeAt(idx || 0) || 0;
-}
-
-function b(str) {
-  return new TextEncoder().encode(str);
-}
-
-function t(buf) {
-  return new TextDecoder().decode(buf);
-}
-
-function makeKey(protocol) {
-  const I = "10", k = 110, B = 1;
-  let M = "";
-  const chars = x("\u1d5f").toString().split("");
-  for (let i = 0; i < chars.length; i++) M += g(I + chars[i]);
-  M += g(x(protocol, I / 10));
-  M += M.slice(1, 3);
-  M += g(k, k - 1, k + 7);
-  const seq = "3579".split("");
-  M += g(seq[3] + seq[2], seq[1] + seq[2]);
-  M += g(seq[0] * B + B + seq[3], seq[0] * B + B + seq[3]);
-  M += g(seq[3] * I + seq[3] * B, seq.reverse().join("").slice(0, 2));
-  return b(M);
-}
-
-function makeIv(protocol, hash) {
-  const protoSep = protocol + "//";
-  const B = protocol.length * protoSep.length;
-  const M = 1;
-  let out = "";
-  for (let i = M; i < 10; i++) out += g(i + B);
-  let se = "";
-  se = M + se + M + se + M;
-  const ce = se.length * x(hash);
-  const Be = se * M + protocol.length;
-  const P = Be + 4;
-  const Z = x(protocol, M);
-  const Ae = Z * M - 2;
-  out += g(B, se, ce, Be, P, Z, Ae);
-  return b(out);
-}
-
-(async () => {
-  const embed = process.argv[2];
-  const u = new URL(embed);
-  const protocol = u.protocol;
-  const hash = u.hash;
-  const api = `${u.origin}/api/v1/video?id=${hash.slice(1)}&w=1920&h=1080&r=hdmozi.hu`;
-  const hex = await fetch(api, {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": embed,
-    "Accept-Language": "hu-HU,hu;q=0.9,en;q=0.8"
-  });
-  const decipher = crypto.createDecipheriv("aes-128-cbc", makeKey(protocol), makeIv(protocol, hash));
-  let plain = decipher.update(Buffer.from(hex.trim(), "hex"));
-  plain = Buffer.concat([plain, decipher.final()]);
-  process.stdout.write(t(plain));
-})().catch((err) => {
-  process.stderr.write(String(err && err.stack || err));
-  process.exit(1);
-});
-'''
-
-    script_path = os.path.join(PROFILE_DIR, "rpmshare_resolver.js")
-    ensure_profile_dir()
-    with open(script_path, "w", encoding="utf-8") as handle:
-        handle.write(script)
-
-    startupinfo = None
-    creationflags = 0
-    if os.name == "nt":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    output = subprocess.check_output(
-        [node_bin, script_path, embed_url],
-        stderr=subprocess.STDOUT,
-        startupinfo=startupinfo,
-        creationflags=creationflags,
-    )
-    return json.loads(output.decode("utf-8", "replace"))
-
-
 def resolve_rpmshare(embed_url):
     parsed = urllib.parse.urlparse(embed_url)
     origin = "{}://{}".format(parsed.scheme, parsed.netloc)
-    payload = resolve_rpmshare_with_node(embed_url)
+    api_url = "{}/api/v1/video?id={}&w=1920&h=1080&r=hdmozi.hu".format(
+        origin,
+        parsed.fragment,
+    )
+    hex_text = request_text(
+        api_url,
+        headers={
+            "Referer": embed_url,
+            "Origin": origin,
+        },
+    )
+    payload = rpm_decrypt(hex_text, parsed.scheme + ":", parsed.fragment and ("#" + parsed.fragment) or parsed.fragment)
     order = payload.get("streamingConfig")
     raw_order = payload.get("streamingConfigRaw")
 
@@ -972,6 +857,10 @@ def play_source(post_id, source_type, nume):
 
 def router(params):
     action = params.get("action")
+
+    if action and action.startswith("sc_"):
+        sorozatcc.router(params)
+        return
 
     if not action:
         list_root()
