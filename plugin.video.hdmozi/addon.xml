@@ -9,6 +9,7 @@
     <extension point="xbmc.python.pluginsource" library="default.py">
         <provides>video</provides>
     </extension>
+    <extension point="xbmc.service" library="service.py" start="startup" />
     <extension point="xbmc.addon.metadata">
         <summary lang="hu">Rombi TV Kodi videó bővítmény</summary>
         <description lang="hu">Rombi TV online videós tartalmak böngészéséhez Kodi alatt.</description>
