@@ -60,6 +60,13 @@ sorozatcc.configure(
 
 
 MEDIA_EXTENSIONS = (".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".ts")
+QUALITY_BANDWIDTH_LIMITS = {
+    480: 1800000,
+    720: 3000000,
+    1080: 6500000,
+    1440: 12000000,
+    2160: 20000000,
+}
 
 
 class SourceResolutionError(ValueError):
@@ -147,6 +154,38 @@ def normalize_url(url):
 
 def strip_url_headers(url):
     return (url or "").split("|", 1)[0]
+
+
+def get_max_stream_height():
+    setting = (ADDON.getSetting("max_stream_height") or "720").strip().lower()
+    if setting in ("0", "auto", "adaptive"):
+        return 0
+    if setting in ("1", "2", "3", "4"):
+        return {"1": 480, "2": 720, "3": 1080, "4": 2160}[setting]
+    try:
+        return int(setting)
+    except ValueError:
+        return 720
+
+
+def get_max_stream_bandwidth():
+    max_height = get_max_stream_height()
+    if not max_height:
+        return 0
+    return QUALITY_BANDWIDTH_LIMITS.get(max_height, max_height * 4500)
+
+
+def select_best_format(formats, max_height=None):
+    if not formats:
+        raise ValueError("Nincs valaszthato videoformatum")
+    max_height = get_max_stream_height() if max_height is None else max_height
+    sorted_formats = sorted(formats, key=lambda item: item.get("height") or 0, reverse=True)
+    if max_height:
+        capped = [item for item in sorted_formats if (item.get("height") or 0) <= max_height]
+        if capped:
+            return capped[0]
+        return sorted(formats, key=lambda item: item.get("height") or 0)[0]
+    return sorted_formats[0]
 
 
 def get_url_host(url):
@@ -242,6 +281,50 @@ def extract_hls_uris(manifest_text):
         for line in (manifest_text or "").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+
+
+def parse_hls_attribute_list(attribute_text):
+    attrs = {}
+    for match in re.finditer(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', attribute_text or ""):
+        value = match.group(2).strip()
+        if value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        attrs[match.group(1)] = value
+    return attrs
+
+
+def parse_hls_variants(manifest_text):
+    variants = []
+    lines = (manifest_text or "").splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        attrs = parse_hls_attribute_list(line.split(":", 1)[1])
+        next_uri = ""
+        for uri_line in lines[index + 1:]:
+            uri_line = uri_line.strip()
+            if uri_line and not uri_line.startswith("#"):
+                next_uri = uri_line
+                break
+        if not next_uri:
+            continue
+        resolution = attrs.get("RESOLUTION") or ""
+        height = 0
+        if "x" in resolution:
+            try:
+                height = int(resolution.lower().split("x", 1)[1])
+            except ValueError:
+                height = 0
+        try:
+            bandwidth = int(attrs.get("BANDWIDTH") or 0)
+        except ValueError:
+            bandwidth = 0
+        variants.append({
+            "uri": next_uri,
+            "height": height,
+            "bandwidth": bandwidth,
+        })
+    return variants
 
 
 def looks_like_png(data):
@@ -353,12 +436,20 @@ def resolve_best_hls_url(url, headers, prefer_vod_child=False):
     if "mpegurl" not in content_type and "m3u" not in content_type and not manifest_text.lstrip().startswith("#EXTM3U"):
         raise ValueError("A HLS manifest nem olvashato")
 
-    uris = extract_hls_uris(manifest_text)
+    variants = parse_hls_variants(manifest_text)
+    uris = [variant["uri"] for variant in variants] or extract_hls_uris(manifest_text)
     if not uris:
         return url
 
     if not prefer_vod_child:
         return url
+
+    max_height = get_max_stream_height()
+    if variants and max_height:
+        sorted_variants = sorted(variants, key=lambda item: item.get("height") or 0, reverse=True)
+        capped_variants = [variant for variant in sorted_variants if (variant.get("height") or 0) <= max_height]
+        ordered_variants = capped_variants or sorted(variants, key=lambda item: item.get("height") or 0)
+        uris = [variant["uri"] for variant in ordered_variants]
 
     best_child_url = ""
     for child_ref in uris:
@@ -913,7 +1004,7 @@ def resolve_videa(player_url):
     if not formats:
         raise ValueError("A Videa források nem találhatók")
 
-    best = sorted(formats, key=lambda item: item["height"], reverse=True)[0]
+    best = select_best_format(formats)
     return {"url": best["url"]}
 
 
@@ -1094,7 +1185,7 @@ def resolve_okru(embed_url):
     if not formats:
         raise ValueError("Az OK.ru forrás nem található")
 
-    best = sorted(formats, key=lambda item: item["height"], reverse=True)[0]
+    best = select_best_format(formats)
     return {"url": best["url"], "headers": stream_headers}
 
 
@@ -1176,7 +1267,7 @@ def resolve_vk(embed_url):
     if not formats:
         raise ValueError("A VK forrás nem található")
 
-    best = sorted(formats, key=lambda item: item["height"], reverse=True)[0]
+    best = select_best_format(formats)
     return {"url": best["url"], "headers": headers}
 
 
@@ -1283,6 +1374,9 @@ def play_source(post_id, source_type, nume):
             item.setContentLookup(False)
             item.setProperty("inputstream", "inputstream.adaptive")
             item.setProperty("inputstream.adaptive.manifest_type", "hls")
+            max_bandwidth = get_max_stream_bandwidth()
+            if max_bandwidth:
+                item.setProperty("inputstream.adaptive.max_bandwidth", str(max_bandwidth))
             if header_string:
                 item.setProperty("inputstream.adaptive.manifest_headers", header_string)
                 item.setProperty("inputstream.adaptive.stream_headers", header_string)

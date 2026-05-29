@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings>
+    <category label="Lejatszas">
+        <setting id="max_stream_height" type="enum" label="Maximalis stream minoseg" values="Automatikus|480p|720p|1080p|4K" default="2" />
+    </category>
+</settings>
