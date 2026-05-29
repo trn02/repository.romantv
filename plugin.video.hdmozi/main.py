@@ -1321,6 +1321,40 @@ def build_header_string(headers):
     )
 
 
+def split_resolved_url_headers(resolved_url):
+    url, _, header_string = (resolved_url or "").partition("|")
+    headers = {}
+    if header_string:
+        for key, value in urllib.parse.parse_qsl(header_string, keep_blank_values=True):
+            headers[key] = value
+    return normalize_url(url), headers
+
+
+def resolve_yandex(embed_url):
+    resolved = resolve_with_resolveurl(embed_url)
+    stream_url, resolved_headers = split_resolved_url_headers(resolved["url"])
+    parsed_embed = urllib.parse.urlparse(embed_url)
+    yandex_origin = "{}://{}".format(parsed_embed.scheme, parsed_embed.netloc)
+    yandex_referer = yandex_origin + "/"
+    stream_headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": resolved_headers.get("Referer") or yandex_referer,
+        "Origin": resolved_headers.get("Origin") or yandex_origin,
+        "Accept": "*/*",
+        "Accept-Language": "hu-HU,hu;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+    }
+    for key, value in resolved_headers.items():
+        if key.lower() not in {"range"}:
+            stream_headers[key] = value
+    stream_headers["User-Agent"] = USER_AGENT
+    return {
+        "url": stream_url,
+        "headers": stream_headers,
+        "direct_type": "mp4",
+    }
+
+
 def resolve_embed_url(embed_url):
     if not embed_url:
         raise SourceResolutionError("resolver_failed", "Üres embed URL", embed_url)
@@ -1342,6 +1376,8 @@ def resolve_embed_url(embed_url):
         return resolve_sbot(embed_url)
     if "filemoon.sx/" in embed_url:
         return resolve_filemoon(embed_url)
+    if "disk.yandex." in embed_url or "yadi.sk/" in embed_url:
+        return resolve_yandex(embed_url)
 
     if is_special_embed_page(embed_url):
         raise SourceResolutionError(
@@ -1377,6 +1413,9 @@ def play_source(post_id, source_type, nume):
             if header_string:
                 item.setProperty("inputstream.adaptive.manifest_headers", header_string)
                 item.setProperty("inputstream.adaptive.stream_headers", header_string)
+        elif resolved.get("direct_type") == "mp4" or ".mp4" in urllib.parse.urlparse(strip_url_headers(resolved["url"])).path.lower():
+            item.setMimeType("video/mp4")
+            item.setContentLookup(False)
         xbmcplugin.setResolvedUrl(ADDON_HANDLE, True, item)
     except SourceResolutionError as exc:
         log("source resolve failed [{}] host={} url={} cause={}".format(exc.kind, exc.host, exc.url, exc.cause or ""))
