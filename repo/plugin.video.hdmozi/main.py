@@ -635,16 +635,24 @@ def parse_page_count(page_html):
     return int(match.group(1)) if match else 1
 
 
-def build_paged_url(first_url, next_url_builder, page):
-    return first_url if page <= 1 else next_url_builder(page)
+def fetch_all_pages(first_url, next_url_builder):
+    progress = xbmcgui.DialogProgress()
+    progress.create("HDMozi", "Találatok betöltése...")
+    pages = []
+    try:
+        first_page = request_text(first_url)
+        pages.append(first_page)
+        total_pages = parse_page_count(first_page)
 
-
-def add_next_page_item(label, action, page, total_pages, extra_query):
-    if page >= total_pages:
-        return
-    target_query = {"action": action, "page": page + 1}
-    target_query.update(extra_query)
-    add_directory_item("{} - kovetkezo oldal ({}/{})".format(label, page + 1, total_pages), target_query)
+        for page_index in range(2, total_pages + 1):
+            percent = int(((page_index - 1) / float(max(total_pages, 1))) * 100)
+            progress.update(percent, "Oldal {} / {}".format(page_index - 1, total_pages))
+            if progress.iscanceled():
+                break
+            pages.append(request_text(next_url_builder(page_index)))
+    finally:
+        progress.close()
+    return pages
 
 
 def parse_search_results(page_html):
@@ -790,18 +798,13 @@ def list_saved_searches():
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
-def run_search_results(query, page=1):
-    first_url = "{}/?s={}".format(SITE_URL, urllib.parse.quote_plus(query))
-    next_url_builder = lambda page_index: "{}/page/{}/?s={}".format(
-        SITE_URL,
-        page_index,
-        urllib.parse.quote_plus(query),
+def run_search_results(query):
+    pages = fetch_all_pages(
+        "{}/?s={}".format(SITE_URL, urllib.parse.quote_plus(query)),
+        lambda page: "{}/page/{}/?s={}".format(SITE_URL, page, urllib.parse.quote_plus(query)),
     )
-    page_html = request_text(build_paged_url(first_url, next_url_builder, page))
-    total_pages = parse_page_count(page_html)
-    for result in parse_search_results(page_html):
+    for result in [item for page in pages for item in parse_search_results(page)]:
         add_result_item(result)
-    add_next_page_item("Kereses", "search_results", page, total_pages, {"query": query})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
@@ -816,15 +819,11 @@ def list_categories():
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
-def run_category_results(name, category_url, page=1):
+def run_category_results(name, category_url):
     base = category_url.rstrip("/")
-    first_url = base + "/"
-    next_url_builder = lambda page_index: "{}/page/{}/".format(base, page_index)
-    page_html = request_text(build_paged_url(first_url, next_url_builder, page))
-    total_pages = parse_page_count(page_html)
-    for result in parse_category_results(page_html):
+    pages = fetch_all_pages(base + "/", lambda page: "{}/page/{}/".format(base, page))
+    for result in [item for page in pages for item in parse_category_results(page)]:
         add_result_item(result)
-    add_next_page_item(name, "category_results", page, total_pages, {"name": name, "url": category_url})
     xbmcplugin.setPluginCategory(ADDON_HANDLE, name)
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
@@ -1124,14 +1123,12 @@ def resolve_rpmshare(embed_url):
                     final_url = resolve_best_hls_url(
                         final_url,
                         stream_headers,
-                        prefer_vod_child=(source_name == "Cloudflare"),
+                        prefer_vod_child=(source_name in ("Cloudflare", "Tiktok")),
                     )
                 except Exception as exc:
                     log("hls selection failed url={} cause={}".format(final_url, exc))
                     continue
                 if not probe_hls_manifest(final_url, stream_headers):
-                    continue
-                if source_name == "Tiktok" and not probe_hls_media(final_url, stream_headers):
                     continue
                 manifest_type = "hls"
             return {
@@ -1393,7 +1390,6 @@ def play_source(post_id, source_type, nume):
 
 def router(params):
     action = params.get("action")
-    page = int(params.get("page", "1") or "1")
 
     if action in (None, "home", "hd_root"):
         maybe_refresh_repository()
@@ -1415,7 +1411,7 @@ def router(params):
         list_saved_searches()
         return
     if action == "search_results":
-        run_search_results(params.get("query", ""), page)
+        run_search_results(params.get("query", ""))
         return
     if action == "delete_saved_search":
         delete_saved_search(params.get("query", ""))
@@ -1425,7 +1421,7 @@ def router(params):
         list_categories()
         return
     if action == "category_results":
-        run_category_results(params.get("name", "Kategória"), params.get("url", SITE_URL), page)
+        run_category_results(params.get("name", "Kategória"), params.get("url", SITE_URL))
         return
     if action == "movie_detail":
         list_movie_detail(params["url"])
