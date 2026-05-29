@@ -8,9 +8,12 @@ import os
 import random
 import re
 import string
+import ssl
 import sys
+import time
 import traceback
 import urllib.parse
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -30,7 +33,12 @@ ADDON_HANDLE = int(sys.argv[1])
 BASE_URL = sys.argv[0]
 PROFILE_DIR = xbmcvfs.translatePath(ADDON.getAddonInfo("profile"))
 SEARCHES_FILE = os.path.join(PROFILE_DIR, "saved_searches.json")
+UPDATE_STATE_FILE = os.path.join(PROFILE_DIR, "update_state.json")
 SITE_URL = "https://hdmozi.hu"
+REPO_ADDONS_URL = "https://trn02.github.io/repository.romantv/repo/addons.xml"
+REPO_REFRESH_INTERVAL_SECONDS = 6 * 60 * 60
+RPM_MAX_ATTEMPTS = 8
+RPM_RETRY_DELAY_SECONDS = 1.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -90,11 +98,24 @@ def request(url, data=None, headers=None, return_headers=False):
         payload = urllib.parse.urlencode(data).encode("utf-8")
 
     req = urllib.request.Request(url, data=payload, headers=final_headers)
-    with urllib.request.urlopen(req, timeout=20) as response:
-        body = response.read()
-        if return_headers:
-            return body, response.headers
-        return body
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            body = response.read()
+            if return_headers:
+                return body, response.headers
+            return body
+    except urllib.error.URLError as exc:
+        reason_text = str(getattr(exc, "reason", exc))
+        host = urllib.parse.urlparse(url).hostname or ""
+        is_ip_host = bool(re.match(r"^\d+\.\d+\.\d+\.\d+$", host))
+        if is_ip_host and "CERTIFICATE_VERIFY_FAILED" in reason_text:
+            context = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=20, context=context) as response:
+                body = response.read()
+                if return_headers:
+                    return body, response.headers
+                return body
+        raise
 
 
 def request_text(url, data=None, headers=None, encoding="utf-8", return_headers=False):
@@ -194,6 +215,169 @@ def ensure_media_result(url, headers=None, input_url=None):
     return result
 
 
+def is_hls_like_url(url):
+    base_url = strip_url_headers(normalize_url(url)).lower()
+    if not base_url:
+        return False
+    path = urllib.parse.urlparse(base_url).path.lower()
+    return ".m3u8" in path or path.endswith(".txt") or "/master." in path
+
+
+def probe_hls_manifest(url, headers):
+    try:
+        manifest_text, response_headers = request_text(url, headers=headers, return_headers=True)
+    except Exception as exc:
+        log("hls probe failed url={} cause={}".format(url, exc))
+        return False
+
+    content_type = (response_headers.get("Content-Type") or "").lower()
+    if "mpegurl" in content_type or "m3u" in content_type:
+        return True
+    return manifest_text.lstrip().startswith("#EXTM3U")
+
+
+def extract_hls_uris(manifest_text):
+    return [
+        line.strip()
+        for line in (manifest_text or "").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def looks_like_png(data):
+    return bool(data and data.startswith(b"\x89PNG\r\n\x1a\n"))
+
+
+def looks_like_html(data):
+    sample = (data or b"")[:256].lstrip().lower()
+    return sample.startswith(b"<!doctype html") or sample.startswith(b"<html")
+
+
+def probe_hls_media(url, headers):
+    try:
+        master_text, master_headers = request_text(url, headers=headers, return_headers=True)
+    except Exception as exc:
+        log("hls media probe master failed url={} cause={}".format(url, exc))
+        return False
+
+    content_type = (master_headers.get("Content-Type") or "").lower()
+    if "mpegurl" not in content_type and "m3u" not in content_type and not master_text.lstrip().startswith("#EXTM3U"):
+        return False
+
+    master_uris = extract_hls_uris(master_text)
+    if not master_uris:
+        return False
+
+    child_url = urllib.parse.urljoin(url, master_uris[0])
+    try:
+        child_text, child_headers = request_text(child_url, headers=headers, return_headers=True)
+    except Exception as exc:
+        log("hls media probe child failed url={} cause={}".format(child_url, exc))
+        return False
+
+    child_type = (child_headers.get("Content-Type") or "").lower()
+    if "mpegurl" not in child_type and "m3u" not in child_type and not child_text.lstrip().startswith("#EXTM3U"):
+        return False
+
+    media_uris = extract_hls_uris(child_text)
+    if not media_uris:
+        return False
+
+    segment_url = urllib.parse.urljoin(child_url, media_uris[0])
+    try:
+        segment_bytes, segment_headers = request(
+            segment_url,
+            headers=dict(headers, Range="bytes=0-31"),
+            return_headers=True,
+        )
+    except Exception as exc:
+        log("hls media probe segment failed url={} cause={}".format(segment_url, exc))
+        return False
+
+    segment_type = (segment_headers.get("Content-Type") or "").lower()
+    if segment_type.startswith("image/") or looks_like_png(segment_bytes):
+        log("hls media probe rejected image segment url={} type={}".format(segment_url, segment_type))
+        return False
+    if "html" in segment_type or looks_like_html(segment_bytes):
+        log("hls media probe rejected html segment url={} type={}".format(segment_url, segment_type))
+        return False
+    return True
+
+
+def probe_hls_child_stream(child_url, headers):
+    try:
+        child_text, child_headers = request_text(child_url, headers=headers, return_headers=True)
+    except Exception as exc:
+        log("hls child stream probe failed url={} cause={}".format(child_url, exc))
+        return False
+
+    child_type = (child_headers.get("Content-Type") or "").lower()
+    if "mpegurl" not in child_type and "m3u" not in child_type and not child_text.lstrip().startswith("#EXTM3U"):
+        return False
+    if "#EXT-X-PLAYLIST-TYPE:VOD" not in child_text or "#EXT-X-ENDLIST" not in child_text:
+        return False
+
+    map_match = re.search(r'^#EXT-X-MAP:URI="([^"]+)"', child_text, re.MULTILINE)
+    if map_match:
+        map_url = urllib.parse.urljoin(child_url, map_match.group(1))
+        try:
+            map_bytes, map_headers = request(map_url, headers=dict(headers, Range="bytes=0-31"), return_headers=True)
+        except Exception as exc:
+            log("hls map probe failed url={} cause={}".format(map_url, exc))
+            return False
+        map_type = (map_headers.get("Content-Type") or "").lower()
+        if map_type.startswith("image/") or "html" in map_type or looks_like_png(map_bytes) or looks_like_html(map_bytes):
+            return False
+
+    media_uris = extract_hls_uris(child_text)
+    if len(media_uris) < 2:
+        return False
+
+    for media_ref in media_uris[:2]:
+        media_url = urllib.parse.urljoin(child_url, media_ref)
+        try:
+            media_bytes, media_headers = request(media_url, headers=dict(headers, Range="bytes=0-31"), return_headers=True)
+        except Exception as exc:
+            log("hls media uri probe failed url={} cause={}".format(media_url, exc))
+            return False
+        media_type = (media_headers.get("Content-Type") or "").lower()
+        if media_type.startswith("image/") or "html" in media_type or looks_like_png(media_bytes) or looks_like_html(media_bytes):
+            return False
+
+    return True
+
+
+def resolve_best_hls_url(url, headers, prefer_vod_child=False):
+    manifest_text, response_headers = request_text(url, headers=headers, return_headers=True)
+    content_type = (response_headers.get("Content-Type") or "").lower()
+    if "mpegurl" not in content_type and "m3u" not in content_type and not manifest_text.lstrip().startswith("#EXTM3U"):
+        raise ValueError("A HLS manifest nem olvashato")
+
+    uris = extract_hls_uris(manifest_text)
+    if not uris:
+        return url
+
+    if not prefer_vod_child:
+        return url
+
+    best_child_url = ""
+    for child_ref in uris:
+        child_url = urllib.parse.urljoin(url, child_ref)
+        if not probe_hls_child_stream(child_url, headers):
+            continue
+
+        try:
+            child_text = request_text(child_url, headers=headers)
+        except Exception:
+            continue
+        if "#EXT-X-PLAYLIST-TYPE:VOD" in child_text and "#EXT-X-ENDLIST" in child_text:
+            return child_url
+        if not best_child_url:
+            best_child_url = child_url
+
+    return best_child_url or url
+
+
 def resolve_with_resolveurl(embed_url):
     supported = has_resolver_support(embed_url)
     if not supported:
@@ -256,6 +440,74 @@ def delete_saved_search(query):
     save_saved_searches(searches)
 
 
+def load_update_state():
+    ensure_profile_dir()
+    if not os.path.exists(UPDATE_STATE_FILE):
+        return {}
+    with open(UPDATE_STATE_FILE, "r", encoding="utf-8") as handle:
+        try:
+            data = json.load(handle)
+        except ValueError:
+            return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_update_state(state):
+    ensure_profile_dir()
+    with open(UPDATE_STATE_FILE, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2)
+
+
+def parse_version_tuple(version):
+    try:
+        return tuple(int(part) for part in (version or "").split("."))
+    except ValueError:
+        return (0,)
+
+
+def fetch_repo_plugin_version():
+    try:
+        addons_xml = request_text(REPO_ADDONS_URL, headers={"Referer": REPO_ADDONS_URL})
+        root = ET.fromstring(addons_xml)
+    except Exception as exc:
+        log("repo version fetch failed: {}".format(exc))
+        return ""
+
+    for addon in root.findall("addon"):
+        if addon.attrib.get("id") == ADDON.getAddonInfo("id"):
+            return addon.attrib.get("version", "")
+    return ""
+
+
+def maybe_refresh_repository(force=False):
+    state = load_update_state()
+    now = int(time.time())
+    last_refresh = int(state.get("last_repo_refresh", 0) or 0)
+    installed_version = ADDON.getAddonInfo("version")
+    remote_version = fetch_repo_plugin_version()
+
+    if remote_version and parse_version_tuple(remote_version) > parse_version_tuple(installed_version):
+        if state.get("last_notified_version") != remote_version:
+            xbmcgui.Dialog().notification(
+                "Rombi TV",
+                "Frissites elerheto: {}".format(remote_version),
+                xbmcgui.NOTIFICATION_INFO,
+                5000,
+            )
+            state["last_notified_version"] = remote_version
+            save_update_state(state)
+        force = True
+
+    if not force and (now - last_refresh) < REPO_REFRESH_INTERVAL_SECONDS:
+        return
+
+    log("triggering Kodi repository refresh")
+    xbmc.executebuiltin("UpdateAddonRepos")
+    xbmc.executebuiltin("UpdateLocalAddons")
+    state["last_repo_refresh"] = now
+    save_update_state(state)
+
+
 def add_directory_item(label, target_query, is_folder=True, art=None, info=None, context=None):
     item = xbmcgui.ListItem(label=label)
     if art:
@@ -288,28 +540,20 @@ def add_playable_item(label, target_query, art=None, info=None):
 
 
 def parse_page_count(page_html):
-    match = re.search(r"Page\s+1\s+of\s+(\d+)", page_html, re.IGNORECASE)
+    match = re.search(r"Page\s+\d+\s+of\s+(\d+)", page_html, re.IGNORECASE)
     return int(match.group(1)) if match else 1
 
 
-def fetch_all_pages(first_url, next_url_builder):
-    progress = xbmcgui.DialogProgress()
-    progress.create("HDMozi", "Találatok betöltése...")
-    pages = []
-    try:
-        first_page = request_text(first_url)
-        pages.append(first_page)
-        total_pages = parse_page_count(first_page)
+def build_paged_url(first_url, next_url_builder, page):
+    return first_url if page <= 1 else next_url_builder(page)
 
-        for page_index in range(2, total_pages + 1):
-            percent = int(((page_index - 1) / float(max(total_pages, 1))) * 100)
-            progress.update(percent, "Oldal {} / {}".format(page_index - 1, total_pages))
-            if progress.iscanceled():
-                break
-            pages.append(request_text(next_url_builder(page_index)))
-    finally:
-        progress.close()
-    return pages
+
+def add_next_page_item(label, action, page, total_pages, extra_query):
+    if page >= total_pages:
+        return
+    target_query = {"action": action, "page": page + 1}
+    target_query.update(extra_query)
+    add_directory_item("{} - kovetkezo oldal ({}/{})".format(label, page + 1, total_pages), target_query)
 
 
 def parse_search_results(page_html):
@@ -455,13 +699,18 @@ def list_saved_searches():
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
-def run_search_results(query):
-    pages = fetch_all_pages(
-        "{}/?s={}".format(SITE_URL, urllib.parse.quote_plus(query)),
-        lambda page: "{}/page/{}/?s={}".format(SITE_URL, page, urllib.parse.quote_plus(query)),
+def run_search_results(query, page=1):
+    first_url = "{}/?s={}".format(SITE_URL, urllib.parse.quote_plus(query))
+    next_url_builder = lambda page_index: "{}/page/{}/?s={}".format(
+        SITE_URL,
+        page_index,
+        urllib.parse.quote_plus(query),
     )
-    for result in [item for page in pages for item in parse_search_results(page)]:
+    page_html = request_text(build_paged_url(first_url, next_url_builder, page))
+    total_pages = parse_page_count(page_html)
+    for result in parse_search_results(page_html):
         add_result_item(result)
+    add_next_page_item("Kereses", "search_results", page, total_pages, {"query": query})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
@@ -476,11 +725,15 @@ def list_categories():
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
-def run_category_results(name, category_url):
+def run_category_results(name, category_url, page=1):
     base = category_url.rstrip("/")
-    pages = fetch_all_pages(base + "/", lambda page: "{}/page/{}/".format(base, page))
-    for result in [item for page in pages for item in parse_category_results(page)]:
+    first_url = base + "/"
+    next_url_builder = lambda page_index: "{}/page/{}/".format(base, page_index)
+    page_html = request_text(build_paged_url(first_url, next_url_builder, page))
+    total_pages = parse_page_count(page_html)
+    for result in parse_category_results(page_html):
         add_result_item(result)
+    add_next_page_item(name, "category_results", page, total_pages, {"name": name, "url": category_url})
     xbmcplugin.setPluginCategory(ADDON_HANDLE, name)
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
@@ -697,13 +950,7 @@ def rpm_decrypt(hex_text, protocol, fragment):
         return json.loads(normalized)
 
 
-def resolve_rpmshare(embed_url):
-    parsed = urllib.parse.urlparse(embed_url)
-    origin = "{}://{}".format(parsed.scheme, parsed.netloc)
-    api_url = "{}/api/v1/video?id={}&w=1920&h=1080&r=hdmozi.hu".format(
-        origin,
-        parsed.fragment,
-    )
+def fetch_rpm_payload(api_url, embed_url, origin, protocol, fragment):
     hex_text = request_text(
         api_url,
         headers={
@@ -711,70 +958,100 @@ def resolve_rpmshare(embed_url):
             "Origin": origin,
         },
     )
-    payload = rpm_decrypt(hex_text, parsed.scheme + ":", parsed.fragment and ("#" + parsed.fragment) or parsed.fragment)
-    order = payload.get("streamingConfig")
-    raw_order = payload.get("streamingConfigRaw")
+    return rpm_decrypt(hex_text, protocol, fragment)
 
-    config = {"order": ["Cloudflare", "Tiktok"], "adjust": {}}
-    if raw_order and isinstance(raw_order, str) and "::" in raw_order:
-        token, expiry = raw_order.split("::", 1)
-        config["adjust"]["Cloudflare"] = {"params": {"t": token, "e": expiry}}
-    if order:
-        try:
-            parsed_config = json.loads(order)
-            if isinstance(parsed_config, dict) and isinstance(parsed_config.get("order"), list):
-                config = parsed_config
-                config.setdefault("adjust", {})
-        except ValueError:
-            pass
 
-    direct_source = payload.get("source")
-    if direct_source:
-        return {
-            "url": normalize_url(direct_source),
-            "headers": {
+def resolve_rpmshare(embed_url):
+    parsed = urllib.parse.urlparse(embed_url)
+    origin = "{}://{}".format(parsed.scheme, parsed.netloc)
+    api_url = "{}/api/v1/video?id={}&w=1920&h=1080&r=hdmozi.hu".format(
+        origin,
+        parsed.fragment,
+    )
+    protocol = parsed.scheme + ":"
+    fragment = parsed.fragment and ("#" + parsed.fragment) or parsed.fragment
+
+    for attempt in range(1, RPM_MAX_ATTEMPTS + 1):
+        payload = fetch_rpm_payload(api_url, embed_url, origin, protocol, fragment)
+        order = payload.get("streamingConfig")
+        raw_order = payload.get("streamingConfigRaw")
+
+        config = {"order": ["Cloudflare", "Tiktok"], "adjust": {}}
+        if raw_order and isinstance(raw_order, str) and "::" in raw_order:
+            token, expiry = raw_order.split("::", 1)
+            config["adjust"]["Cloudflare"] = {"params": {"t": token, "e": expiry}}
+        if order:
+            try:
+                parsed_config = json.loads(order)
+                if isinstance(parsed_config, dict) and isinstance(parsed_config.get("order"), list):
+                    config = parsed_config
+                    config.setdefault("adjust", {})
+            except ValueError:
+                pass
+
+        source_map = {
+            "In-House": payload.get("source"),
+            "Google": payload.get("hlsVideoGoogle"),
+            "Tiktok": payload.get("hlsVideoTiktok") or payload.get("tt"),
+            "Cloudflare": payload.get("cf"),
+        }
+
+        configured_order = config.get("order", [])
+        preferred_order = ["Cloudflare", "In-House", "Google", "Tiktok"] + configured_order
+        merged_order = []
+        for source_name in preferred_order:
+            if source_name not in merged_order:
+                merged_order.append(source_name)
+
+        for source_name in merged_order:
+            source_url = source_map.get(source_name)
+            if not source_url:
+                continue
+            adjust = config.get("adjust", {}).get(source_name, {})
+            if adjust.get("disabled"):
+                continue
+            normalized_source = urllib.parse.urljoin(origin + "/", normalize_url(source_url))
+            parsed_source = urllib.parse.urlparse(normalized_source)
+            source_query = dict(urllib.parse.parse_qsl(parsed_source.query))
+            source_query.update(adjust.get("params", {}))
+            final_url = urllib.parse.urlunparse((
+                parsed_source.scheme,
+                parsed_source.netloc,
+                parsed_source.path,
+                parsed_source.params,
+                urllib.parse.urlencode(source_query),
+                parsed_source.fragment,
+            ))
+            stream_headers = {
                 "Referer": embed_url,
                 "Origin": origin,
                 "User-Agent": USER_AGENT,
-            },
-        }
+            }
+            manifest_type = None
+            if is_hls_like_url(final_url):
+                try:
+                    final_url = resolve_best_hls_url(
+                        final_url,
+                        stream_headers,
+                        prefer_vod_child=(source_name == "Cloudflare"),
+                    )
+                except Exception as exc:
+                    log("hls selection failed url={} cause={}".format(final_url, exc))
+                    continue
+                if not probe_hls_manifest(final_url, stream_headers):
+                    continue
+                if source_name == "Tiktok" and not probe_hls_media(final_url, stream_headers):
+                    continue
+                manifest_type = "hls"
+            return {
+                "url": final_url,
+                "headers": stream_headers,
+                "manifest_type": manifest_type,
+            }
 
-    source_map = {
-        "In-House": payload.get("source"),
-        "Google": payload.get("hlsVideoGoogle"),
-        "Tiktok": payload.get("tt"),
-        "Cloudflare": payload.get("cf"),
-    }
-
-    preferred_order = ["In-House", "Google", "Tiktok", "Cloudflare"]
-    configured_order = config.get("order", [])
-    merged_order = preferred_order + [name for name in configured_order if name not in preferred_order]
-
-    for source_name in merged_order:
-        source_url = source_map.get(source_name)
-        if not source_url:
-            continue
-        normalized_source = urllib.parse.urljoin(origin + "/", normalize_url(source_url))
-        parsed_source = urllib.parse.urlparse(normalized_source)
-        source_query = dict(urllib.parse.parse_qsl(parsed_source.query))
-        adjust = config.get("adjust", {}).get(source_name, {})
-        source_query.update(adjust.get("params", {}))
-        final_url = urllib.parse.urlunparse((
-            parsed_source.scheme,
-            parsed_source.netloc,
-            parsed_source.path,
-            parsed_source.params,
-            urllib.parse.urlencode(source_query),
-            parsed_source.fragment,
-        ))
-        return {
-            "url": final_url,
-            "headers": {
-                "Referer": embed_url,
-                "Origin": origin,
-                "User-Agent": USER_AGENT,
-            },
-        }
+        if attempt < RPM_MAX_ATTEMPTS:
+            log("rpm retry {}/{} fragment={}".format(attempt, RPM_MAX_ATTEMPTS, parsed.fragment))
+            time.sleep(RPM_RETRY_DELAY_SECONDS)
 
     raise ValueError("Az RPMStream forrás nem található")
 
@@ -999,7 +1276,8 @@ def play_source(post_id, source_type, nume):
             header_string = build_header_string(headers)
             item_path = stream_url + "|" + header_string
         item = xbmcgui.ListItem(path=item_path)
-        if ".m3u8" in strip_url_headers(resolved["url"]):
+        manifest_type = resolved.get("manifest_type")
+        if manifest_type == "hls" or ".m3u8" in strip_url_headers(resolved["url"]):
             header_string = build_header_string(headers)
             item.setMimeType("application/vnd.apple.mpegurl")
             item.setContentLookup(False)
@@ -1021,6 +1299,10 @@ def play_source(post_id, source_type, nume):
 
 def router(params):
     action = params.get("action")
+    page = int(params.get("page", "1") or "1")
+
+    if action in (None, "home", "hd_root"):
+        maybe_refresh_repository()
 
     if action and action.startswith("sc_"):
         sorozatcc.router(params)
@@ -1039,7 +1321,7 @@ def router(params):
         list_saved_searches()
         return
     if action == "search_results":
-        run_search_results(params.get("query", ""))
+        run_search_results(params.get("query", ""), page)
         return
     if action == "delete_saved_search":
         delete_saved_search(params.get("query", ""))
@@ -1049,7 +1331,7 @@ def router(params):
         list_categories()
         return
     if action == "category_results":
-        run_category_results(params.get("name", "Kategória"), params.get("url", SITE_URL))
+        run_category_results(params.get("name", "Kategória"), params.get("url", SITE_URL), page)
         return
     if action == "movie_detail":
         list_movie_detail(params["url"])
