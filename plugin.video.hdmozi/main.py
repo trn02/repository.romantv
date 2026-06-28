@@ -25,7 +25,7 @@ import xbmcplugin
 import xbmcvfs
 
 from resources.lib.pyaes import AESModeOfOperationCBC, Decrypter
-from resources.lib import sorozatcc
+from resources.lib import jobbmintatv, sorozatcc
 
 
 ADDON = xbmcaddon.Addon()
@@ -56,6 +56,14 @@ sorozatcc.configure(
     action_prefix="sc_",
     embed_resolver=lambda url: resolve_embed_url(url),
     source_classifier=lambda url: classify_source_url(url),
+)
+
+jobbmintatv.configure(
+    base_url=BASE_URL,
+    addon_handle=ADDON_HANDLE,
+    profile_dir=PROFILE_DIR,
+    action_prefix="jmtv_",
+    embed_resolver=lambda url: resolve_embed_url(url),
 )
 
 
@@ -781,6 +789,7 @@ def prompt_search():
 def list_root():
     add_directory_item("hdmozi.hu", {"action": "hd_root"})
     add_directory_item("Sorozat.cc", {"action": "sc_root"})
+    add_directory_item("JobbMintATV", {"action": "jmtv_root"})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
@@ -1453,6 +1462,9 @@ def router(params):
 
     if action and action.startswith("sc_"):
         sorozatcc.router(params)
+        return
+    if action and action.startswith("jmtv_"):
+        jobbmintatv.router(params)
         return
 
     if not action:
