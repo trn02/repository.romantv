@@ -26,6 +26,14 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+SORT_OPTIONS = [
+    ("Legfrissebb feltöltés", "1"),
+    ("Legnépszerűbb", "5"),
+    ("Legújabb évjárat", "3"),
+    ("Legtöbb látogató", "4"),
+    ("Legjobb IMDb", "2"),
+    ("Cím szerint", "0"),
+]
 
 
 def configure(base_url=None, addon_handle=None, profile_dir=None, action_prefix=None, embed_resolver=None):
@@ -246,8 +254,10 @@ def list_root():
     add_directory_item("Keresés", {"action": "prompt_search"}, is_folder=False)
     add_directory_item("Mentett keresések", {"action": "saved_searches"})
     add_directory_item("Online filmek", {"action": "list", "kind": "movies", "url": SITE_URL + "/filmek/1/1"})
+    add_directory_item("Filmek rendezése", {"action": "sorts", "kind": "movies"})
     add_directory_item("Film kategóriák", {"action": "categories", "kind": "movies"})
     add_directory_item("Online sorozatok", {"action": "list", "kind": "series", "url": SITE_URL + "/sorozatok/1/1"})
+    add_directory_item("Sorozatok rendezése", {"action": "sorts", "kind": "series"})
     add_directory_item("Sorozat kategóriák", {"action": "categories", "kind": "series"})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
@@ -307,6 +317,16 @@ def list_categories(kind):
     base_url = SITE_URL + ("/filmek/1/1" if kind == "movies" else "/sorozatok/1/1")
     for name, category_url in parse_categories(request_text(base_url), kind):
         add_directory_item(name, {"action": "list", "kind": kind, "url": category_url})
+    xbmcplugin.endOfDirectory(ADDON_HANDLE)
+
+
+def list_sorts(kind):
+    base = "filmek" if kind == "movies" else "sorozatok"
+    for label, sort_code in SORT_OPTIONS:
+        add_directory_item(
+            label,
+            {"action": "list", "kind": kind, "url": "{}/{}/{}/1/".format(SITE_URL, base, sort_code)},
+        )
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
@@ -388,6 +408,8 @@ def router(params):
         list_catalog(params.get("kind", "movies"), params.get("url", SITE_URL + "/filmek/1/1"))
     elif action == "categories":
         list_categories(params.get("kind", "movies"))
+    elif action == "sorts":
+        list_sorts(params.get("kind", "movies"))
     elif action == "detail":
         list_detail(params["url"])
     elif action == "season":

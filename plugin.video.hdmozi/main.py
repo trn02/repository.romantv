@@ -123,7 +123,8 @@ def request(url, data=None, headers=None, return_headers=False):
         reason_text = str(getattr(exc, "reason", exc))
         host = urllib.parse.urlparse(url).hostname or ""
         is_ip_host = bool(re.match(r"^\d+\.\d+\.\d+\.\d+$", host))
-        if is_ip_host and "CERTIFICATE_VERIFY_FAILED" in reason_text:
+        allow_unverified = is_ip_host or host in {"vk.com", "www.vk.com", "vkvideo.ru", "www.vkvideo.ru"}
+        if allow_unverified and "CERTIFICATE_VERIFY_FAILED" in reason_text:
             context = ssl._create_unverified_context()
             with urllib.request.urlopen(req, timeout=20, context=context) as response:
                 body = response.read()
@@ -1211,6 +1212,9 @@ def resolve_okru(embed_url):
 
 
 def resolve_vk(embed_url):
+    parsed_input = urllib.parse.urlparse(embed_url)
+    if parsed_input.netloc.lower() in {"vkvideo.ru", "www.vkvideo.ru"}:
+        embed_url = urllib.parse.urlunparse(parsed_input._replace(netloc="vk.com"))
     parsed = urllib.parse.urlparse(embed_url)
     host = parsed.netloc
     ref = "https://{}/".format(host)
@@ -1271,6 +1275,28 @@ def resolve_vk(embed_url):
         if match:
             fallback_data = json.loads(match.group(1))
             player_data = fallback_data.get("params", [{}])[0]
+        else:
+            marker = "Object.assign(window.cur || {}, "
+            marker_index = page_html.find(marker)
+            if marker_index != -1:
+                json_start = marker_index + len(marker)
+                try:
+                    prefetched_data, _ = json.JSONDecoder().raw_decode(page_html[json_start:])
+                    cache_items = prefetched_data.get("apiPrefetchCache", [])
+                    for cache_item in cache_items:
+                        response = cache_item.get("response") or {}
+                        video_items = response.get("items") or []
+                        if not video_items:
+                            continue
+                        files = video_items[0].get("files") or {}
+                        for file_key, file_url in files.items():
+                            if file_key.startswith("mp4_"):
+                                player_data["url" + file_key.split("_", 1)[1]] = file_url
+                        if files.get("hls"):
+                            player_data["hls"] = files["hls"]
+                        break
+                except (TypeError, ValueError) as exc:
+                    log("vk prefetch parse failed: {}".format(exc))
 
     formats = []
     for key, value in player_data.items():
@@ -1282,14 +1308,12 @@ def resolve_vk(embed_url):
             formats.append({"url": normalize_url(value), "height": height})
 
     hls_url = player_data.get("hls") or player_data.get("hls_live") or player_data.get("hls_ondemand")
+    if formats:
+        best = select_best_format(formats)
+        return {"url": best["url"], "headers": headers, "direct_type": "mp4"}
     if hls_url:
-        return {"url": normalize_url(hls_url), "headers": headers}
-
-    if not formats:
-        raise ValueError("A VK forrás nem található")
-
-    best = select_best_format(formats)
-    return {"url": best["url"], "headers": headers}
+        return {"url": normalize_url(hls_url), "headers": headers, "manifest_type": "hls"}
+    raise ValueError("A VK forrás nem található")
 
 
 def resolve_sbot(embed_url):
