@@ -253,11 +253,9 @@ def parse_categories(page_html, kind):
 def list_root():
     add_directory_item("Keresés", {"action": "prompt_search"}, is_folder=False)
     add_directory_item("Mentett keresések", {"action": "saved_searches"})
-    add_directory_item("Online filmek", {"action": "list", "kind": "movies", "url": SITE_URL + "/filmek/1/1"})
-    add_directory_item("Filmek rendezése", {"action": "sorts", "kind": "movies"})
+    add_directory_item("Filmek", {"action": "sorts", "kind": "movies"})
     add_directory_item("Film kategóriák", {"action": "categories", "kind": "movies"})
-    add_directory_item("Online sorozatok", {"action": "list", "kind": "series", "url": SITE_URL + "/sorozatok/1/1"})
-    add_directory_item("Sorozatok rendezése", {"action": "sorts", "kind": "series"})
+    add_directory_item("Sorozatok", {"action": "sorts", "kind": "series"})
     add_directory_item("Sorozat kategóriák", {"action": "categories", "kind": "series"})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
@@ -316,16 +314,23 @@ def list_catalog(kind, url):
 def list_categories(kind):
     base_url = SITE_URL + ("/filmek/1/1" if kind == "movies" else "/sorozatok/1/1")
     for name, category_url in parse_categories(request_text(base_url), kind):
-        add_directory_item(name, {"action": "list", "kind": kind, "url": category_url})
+        add_directory_item(name, {"action": "sorts", "kind": kind, "url": category_url})
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
-def list_sorts(kind):
+def apply_sort_to_url(kind, sort_code, category_url=""):
     base = "filmek" if kind == "movies" else "sorozatok"
+    if not category_url:
+        return "{}/{}/{}/1/".format(SITE_URL, base, sort_code)
+    pattern = r"(/{}\/)[^/]+/[^/]+/".format(base)
+    return re.sub(pattern, r"\g<1>{}/1/".format(sort_code), category_url, count=1)
+
+
+def list_sorts(kind, category_url=""):
     for label, sort_code in SORT_OPTIONS:
         add_directory_item(
             label,
-            {"action": "list", "kind": kind, "url": "{}/{}/{}/1/".format(SITE_URL, base, sort_code)},
+            {"action": "list", "kind": kind, "url": apply_sort_to_url(kind, sort_code, category_url)},
         )
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
@@ -409,7 +414,7 @@ def router(params):
     elif action == "categories":
         list_categories(params.get("kind", "movies"))
     elif action == "sorts":
-        list_sorts(params.get("kind", "movies"))
+        list_sorts(params.get("kind", "movies"), params.get("url", ""))
     elif action == "detail":
         list_detail(params["url"])
     elif action == "season":
