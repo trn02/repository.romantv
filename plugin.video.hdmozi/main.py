@@ -175,6 +175,13 @@ def get_max_stream_bandwidth():
     return QUALITY_BANDWIDTH_LIMITS.get(max_height, max_height * 4500)
 
 
+def is_android_platform():
+    try:
+        return bool(xbmc.getCondVisibility("System.Platform.Android"))
+    except Exception:
+        return False
+
+
 def select_best_format(formats, max_height=None):
     if not formats:
         raise ValueError("Nincs valaszthato videoformatum")
@@ -1087,7 +1094,10 @@ def resolve_rpmshare(embed_url):
         }
 
         configured_order = config.get("order", [])
-        preferred_order = ["Cloudflare", "In-House", "Google", "Tiktok"] + configured_order
+        if is_android_platform():
+            preferred_order = ["In-House", "Cloudflare", "Google", "Tiktok"] + configured_order
+        else:
+            preferred_order = ["Cloudflare", "In-House", "Google", "Tiktok"] + configured_order
         merged_order = []
         for source_name in preferred_order:
             if source_name not in merged_order:
@@ -1102,6 +1112,9 @@ def resolve_rpmshare(embed_url):
                 continue
             normalized_source = urllib.parse.urljoin(origin + "/", normalize_url(source_url))
             parsed_source = urllib.parse.urlparse(normalized_source)
+            source_host = parsed_source.hostname or ""
+            if source_name == "In-House" and re.match(r"^\d+\.\d+\.\d+\.\d+$", source_host):
+                parsed_source = parsed_source._replace(scheme="http")
             source_query = dict(urllib.parse.parse_qsl(parsed_source.query))
             source_query.update(adjust.get("params", {}))
             final_url = urllib.parse.urlunparse((
@@ -1123,7 +1136,7 @@ def resolve_rpmshare(embed_url):
                     final_url = resolve_best_hls_url(
                         final_url,
                         stream_headers,
-                        prefer_vod_child=(source_name in ("Cloudflare", "Tiktok")),
+                        prefer_vod_child=(source_name in ("Cloudflare", "In-House", "Tiktok")),
                     )
                 except Exception as exc:
                     log("hls selection failed url={} cause={}".format(final_url, exc))
@@ -1131,6 +1144,7 @@ def resolve_rpmshare(embed_url):
                 if not probe_hls_manifest(final_url, stream_headers):
                     continue
                 manifest_type = "hls"
+            log("rpm selected source={} android={} url={}".format(source_name, is_android_platform(), final_url))
             return {
                 "url": final_url,
                 "headers": stream_headers,
