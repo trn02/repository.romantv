@@ -1149,6 +1149,7 @@ def resolve_rpmshare(embed_url):
                 "url": final_url,
                 "headers": stream_headers,
                 "manifest_type": manifest_type,
+                "native_hls": bool(manifest_type == "hls" and is_android_platform()),
             }
 
         if attempt < RPM_MAX_ATTEMPTS:
@@ -1419,14 +1420,17 @@ def play_source(post_id, source_type, nume):
             header_string = build_header_string(headers)
             item.setMimeType("application/vnd.apple.mpegurl")
             item.setContentLookup(False)
-            item.setProperty("inputstream", "inputstream.adaptive")
-            item.setProperty("inputstream.adaptive.manifest_type", "hls")
-            max_bandwidth = get_max_stream_bandwidth()
-            if max_bandwidth:
-                item.setProperty("inputstream.adaptive.max_bandwidth", str(max_bandwidth))
-            if header_string:
-                item.setProperty("inputstream.adaptive.manifest_headers", header_string)
-                item.setProperty("inputstream.adaptive.stream_headers", header_string)
+            if resolved.get("native_hls"):
+                log("using native Kodi HLS demuxer for Android audio compatibility")
+            else:
+                item.setProperty("inputstream", "inputstream.adaptive")
+                item.setProperty("inputstream.adaptive.manifest_type", "hls")
+                max_bandwidth = get_max_stream_bandwidth()
+                if max_bandwidth:
+                    item.setProperty("inputstream.adaptive.max_bandwidth", str(max_bandwidth))
+                if header_string:
+                    item.setProperty("inputstream.adaptive.manifest_headers", header_string)
+                    item.setProperty("inputstream.adaptive.stream_headers", header_string)
         elif resolved.get("direct_type") == "mp4" or ".mp4" in urllib.parse.urlparse(strip_url_headers(resolved["url"])).path.lower():
             item.setMimeType("video/mp4")
             item.setContentLookup(False)
