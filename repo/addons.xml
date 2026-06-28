@@ -18,7 +18,7 @@
             </assets>
         </extension>
     </addon>
-    <addon id="plugin.video.hdmozi" name="Rombi TV" version="1.2.8" provider-name="Rombi">
+    <addon id="plugin.video.hdmozi" name="Rombi TV" version="1.2.9" provider-name="Rombi">
         <requires>
             <import addon="xbmc.python" version="3.0.0" />
         </requires>

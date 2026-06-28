@@ -285,7 +285,7 @@ def extract_csrf(page_html):
     return match.group(1) if match else ""
 
 
-def livewire_call(page_url, component_name, method, params):
+def livewire_request(page_url, component_name, updates=None, calls=None):
     opener, _ = new_opener()
     page_html = request_text(page_url, opener=opener)
     csrf = extract_csrf(page_html)
@@ -296,8 +296,8 @@ def livewire_call(page_url, component_name, method, params):
         "_token": csrf,
         "components": [{
             "snapshot": snapshot,
-            "updates": {},
-            "calls": [{"path": "", "method": method, "params": params}],
+            "updates": updates or {},
+            "calls": calls or [],
         }],
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -315,6 +315,14 @@ def livewire_call(page_url, component_name, method, params):
     )
     with opener.open(req, timeout=20) as response:
         return response.read().decode("utf-8", "replace")
+
+
+def livewire_call(page_url, component_name, method, params):
+    return livewire_request(
+        page_url,
+        component_name,
+        calls=[{"path": "", "method": method, "params": params}],
+    )
 
 
 def parse_livewire_response(response_text):
@@ -506,6 +514,27 @@ def build_page_url(base_url, page, query):
     return base_url
 
 
+def list_component_name(kind):
+    return "series.list-series" if kind == "series" else "movies.movies"
+
+
+def fetch_list_livewire(base_url, kind, updates=None, page=1):
+    calls = []
+    if int(page) > 1:
+        calls.append({"path": "", "method": "gotoPage", "params": [int(page), "page"]})
+    response = livewire_request(
+        base_url,
+        list_component_name(kind),
+        updates=updates or {},
+        calls=calls,
+    )
+    _, effects = parse_livewire_response(response)
+    page_html = effects.get("html", "")
+    if not page_html:
+        raise ValueError("A Sorozat.cc nem adott vissza listat")
+    return page_html
+
+
 def run_list_page(page_html, kind, category_label, base_url, base_query):
     items = parse_cards(page_html, kind)
     for item in items:
@@ -546,10 +575,10 @@ def list_sorted(kind, sort_key, category_url, category_name):
     base_url = category_url or (SITE_URL + ("/sorozatok" if kind == "series" else "/filmek"))
     label = category_name or sort_def.get("label", "Lista")
     if sort_key in ["latest_upload", "az", "new_links", "new_playback"]:
-        page_html = request_text(build_page_url(base_url, 1, sort_query))
+        page_html = fetch_list_livewire(base_url, kind, updates=sort_query)
         run_list_page(page_html, kind, label, base_url, sort_query)
         return
-    component_name = "series.list-series" if kind == "series" else "movies.movies"
+    component_name = list_component_name(kind)
     response = livewire_call(base_url, component_name, sort_def["method"], [])
     snapshot_data, effects = parse_livewire_response(response)
     page_html = effects.get("html", "")
@@ -564,15 +593,15 @@ def list_sorted(kind, sort_key, category_url, category_name):
 
 def list_paged(kind, base_url, query_json, page, name):
     query = json.loads(query_json) if query_json else {}
-    page_html = request_text(build_page_url(base_url, int(page), query))
+    page_html = fetch_list_livewire(base_url, kind, updates=query, page=int(page))
     run_list_page(page_html, kind, name, base_url, query)
 
 
 def run_search_results(search_type, query):
     remember_search(query)
     base_url = SITE_URL + ("/filmek" if search_type == "movie" else "/sorozatok")
-    search_query = {"kereses": query}
-    page_html = request_text(build_page_url(base_url, 1, search_query))
+    search_query = {"search": query}
+    page_html = fetch_list_livewire(base_url, search_type, updates=search_query)
     run_list_page(page_html, search_type, "Keresés: {}".format(query), base_url, search_query)
 
 
